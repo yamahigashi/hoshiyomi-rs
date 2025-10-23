@@ -21,6 +21,8 @@ pub struct UserRecord {
     pub fetch_interval_minutes: i64,
     pub next_check_at: DateTime<Utc>,
     pub activity_tier: Option<String>,
+    pub ema_minutes: Option<f64>,
+    pub star_count: i64,
 }
 
 pub async fn init(db_path: &Path) -> Result<()> {
@@ -39,7 +41,9 @@ pub async fn init(db_path: &Path) -> Result<()> {
                 last_modified TEXT,
                 fetch_interval_minutes INTEGER NOT NULL,
                 next_check_at TEXT NOT NULL,
-                activity_tier TEXT
+                activity_tier TEXT,
+                ema_minutes REAL,
+                star_count INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS stars (
@@ -61,6 +65,8 @@ pub async fn init(db_path: &Path) -> Result<()> {
         )?;
 
         ensure_column(&conn, "users", "activity_tier", "TEXT")?;
+        ensure_column(&conn, "users", "ema_minutes", "REAL")?;
+        ensure_column(&conn, "users", "star_count", "INTEGER")?;
         ensure_column(&conn, "stars", "repo_language", "TEXT")?;
         ensure_column(&conn, "stars", "repo_topics", "TEXT")?;
 
@@ -75,6 +81,16 @@ pub async fn init(db_path: &Path) -> Result<()> {
         )?;
         conn.execute(
             "UPDATE users SET activity_tier = 'low' WHERE activity_tier IS NULL AND fetch_interval_minutes > 1440",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE users SET star_count = 0 WHERE star_count IS NULL",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE users SET star_count = (
+                 SELECT COUNT(*) FROM stars WHERE stars.user_id = users.user_id
+             )",
             [],
         )?;
         Ok(())
@@ -99,8 +115,8 @@ pub async fn upsert_followings(
         let tx = conn.transaction()?;
         for user in users {
             tx.execute(
-                "INSERT INTO users (user_id, login, last_starred_at, last_fetched_at, etag, last_modified, fetch_interval_minutes, next_check_at)
-                 VALUES (?1, ?2, NULL, NULL, NULL, NULL, ?3, ?4)
+                "INSERT INTO users (user_id, login, last_starred_at, last_fetched_at, etag, last_modified, fetch_interval_minutes, next_check_at, activity_tier, ema_minutes, star_count)
+                 VALUES (?1, ?2, NULL, NULL, NULL, NULL, ?3, ?4, 'low', NULL, 0)
                  ON CONFLICT(user_id) DO UPDATE SET login = excluded.login",
                 params![user.id, user.login, default_interval_minutes, now],
             )?;
@@ -118,7 +134,7 @@ pub async fn due_users(db_path: &Path, now: DateTime<Utc>) -> Result<Vec<UserRec
     let users = tokio::task::spawn_blocking(move || -> rusqlite::Result<Vec<UserRecord>> {
         let conn = Connection::open(path)?;
         let mut stmt = conn.prepare(
-            "SELECT user_id, login, last_starred_at, last_fetched_at, etag, last_modified, fetch_interval_minutes, next_check_at, activity_tier
+            "SELECT user_id, login, last_starred_at, last_fetched_at, etag, last_modified, fetch_interval_minutes, next_check_at, activity_tier, ema_minutes, star_count
              FROM users
              WHERE next_check_at <= ?1
              ORDER BY next_check_at ASC",
@@ -140,6 +156,8 @@ pub async fn due_users(db_path: &Path, now: DateTime<Utc>) -> Result<Vec<UserRec
                 fetch_interval_minutes: row.get(6)?,
                 next_check_at,
                 activity_tier: row.get(8)?,
+                ema_minutes: row.get(9)?,
+                star_count: row.get(10)?,
             })
         })?;
         let mut users = Vec::new();
@@ -214,12 +232,14 @@ pub async fn insert_star_events(
         // Even if there are no events, update metadata to refresh next_check_at
         update_after_events(
             db_path,
-            user.user_id,
+            user,
             user.last_starred_at,
             fetched_at,
             etag,
             last_modified,
             config,
+            0,
+            &[],
         )
         .await?;
         return Ok(user.fetch_interval_minutes);
@@ -231,16 +251,17 @@ pub async fn insert_star_events(
     let events_vec = events.to_owned();
     let etag_clone = etag.clone();
     let last_modified_clone = last_modified.clone();
-    tokio::task::spawn_blocking(move || -> rusqlite::Result<()> {
+    let inserted_count = tokio::task::spawn_blocking(move || -> rusqlite::Result<i64> {
         let mut conn = Connection::open(path)?;
         let tx = conn.transaction()?;
+        let mut inserted = 0i64;
         for event in &events_vec {
             let topics_json = if event.repo_topics.is_empty() {
                 None
             } else {
                 serde_json::to_string(&event.repo_topics).ok()
             };
-            tx.execute(
+            inserted += tx.execute(
                 "INSERT OR IGNORE INTO stars (user_id, repo_full_name, repo_description, repo_language, repo_topics, repo_html_url, starred_at, fetched_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
@@ -253,7 +274,7 @@ pub async fn insert_star_events(
                     event.starred_at.to_rfc3339(),
                     fetched
                 ],
-            )?;
+            )? as i64;
         }
         if let Some(max_starred) = events_vec.iter().map(|e| e.starred_at).max() {
             tx.execute(
@@ -280,50 +301,85 @@ pub async fn insert_star_events(
             params![fetched, user_id],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(inserted)
     })
     .await??;
 
+    let mut sorted_events = events.to_vec();
+    sorted_events.sort_by_key(|e| e.starred_at);
+    let gaps = compute_gap_minutes(&sorted_events, user.last_starred_at);
+
     update_after_events(
         db_path,
-        user.user_id,
+        user,
         None,
         fetched_at,
         etag,
         last_modified,
         config,
+        inserted_count,
+        &gaps,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn update_after_events(
     db_path: &Path,
-    user_id: i64,
+    user: &UserRecord,
     cached_last_starred: Option<DateTime<Utc>>,
     fetched_at: DateTime<Utc>,
     etag: Option<String>,
     last_modified: Option<String>,
     config: &Config,
+    inserted_count: i64,
+    gaps: &[i64],
 ) -> Result<i64> {
-    let activity = recompute_interval(db_path, user_id, config).await?;
+    let min_interval = config.min_interval_minutes;
+    let max_interval = config.max_interval_minutes;
+    let default_interval = config.default_interval_minutes;
+    let previous_interval = user.fetch_interval_minutes;
+    let previous_star_count = user.star_count;
+    let previous_ema = user.ema_minutes;
+    let new_star_count = previous_star_count + inserted_count;
+
+    let activity = recompute_interval(
+        db_path,
+        user.user_id,
+        min_interval,
+        max_interval,
+        default_interval,
+        previous_interval,
+        previous_star_count,
+        previous_ema,
+        new_star_count,
+        gaps.to_vec(),
+    )
+    .await?;
     let next = (fetched_at + Duration::minutes(activity.interval_minutes)).to_rfc3339();
     let fetched = fetched_at.to_rfc3339();
     let etag_val = etag;
     let last_mod_val = last_modified;
+    let activity_tier = activity.activity_tier.clone();
+    let ema_value = activity.ema_minutes;
+    let user_id = user.user_id;
     let path = db_path.to_path_buf();
     tokio::task::spawn_blocking(move || -> rusqlite::Result<()> {
         let conn = Connection::open(path)?;
         conn.execute(
             "UPDATE users SET next_check_at = ?1, fetch_interval_minutes = ?2, last_fetched_at = ?3,
-             etag = COALESCE(?4, etag), last_modified = COALESCE(?5, last_modified), activity_tier = ?6
-             WHERE user_id = ?7",
+             etag = COALESCE(?4, etag), last_modified = COALESCE(?5, last_modified), activity_tier = ?6,
+             ema_minutes = ?7, star_count = ?8
+             WHERE user_id = ?9",
             params![
                 next,
                 activity.interval_minutes,
                 fetched,
                 etag_val,
                 last_mod_val,
-                activity.activity_tier,
+                activity_tier,
+                ema_value,
+                new_star_count,
                 user_id
             ],
         )?;
@@ -343,54 +399,83 @@ async fn update_after_events(
 pub struct ActivityProfile {
     pub interval_minutes: i64,
     pub activity_tier: Option<String>,
+    pub ema_minutes: Option<f64>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn recompute_interval(
     db_path: &Path,
     user_id: i64,
-    config: &Config,
+    min_interval: i64,
+    max_interval: i64,
+    default_interval: i64,
+    previous_interval: i64,
+    previous_star_count: i64,
+    previous_ema: Option<f64>,
+    new_star_count: i64,
+    gaps: Vec<i64>,
 ) -> Result<ActivityProfile> {
     let path = db_path.to_path_buf();
-    let default_interval = config.default_interval_minutes;
-    let min_interval = config.min_interval_minutes;
-    let max_interval = config.max_interval_minutes;
     let profile = tokio::task::spawn_blocking(move || -> rusqlite::Result<ActivityProfile> {
-        let conn = Connection::open(path)?;
-        let mut stmt = conn.prepare(
-            "SELECT starred_at FROM stars WHERE user_id = ?1 ORDER BY starred_at DESC LIMIT 5",
-        )?;
-        let rows = stmt.query_map([user_id], |row| {
-            let starred_at: String = row.get(0)?;
-            parse_datetime_sql(&starred_at, 0)
-        })?;
-        let mut timestamps = Vec::new();
-        for ts in rows {
-            timestamps.push(ts?);
+        let mut conn = Connection::open(path)?;
+        let min_clamped = min_interval.max(1);
+        let max_clamped = max_interval.max(min_clamped);
+        let fallback = default_interval.clamp(min_clamped, max_clamped);
+        let mut interval_minutes = previous_interval.clamp(min_clamped, max_clamped);
+        let mut ema = previous_ema;
+        let alpha = 0.3f64;
+        let min_f = min_clamped as f64;
+        let max_f = max_clamped as f64;
+
+        let mut star_count = previous_star_count;
+        for gap in &gaps {
+            star_count += 1;
+            let gap_minutes = (*gap).max(1) as f64;
+
+            if star_count < 3 {
+                ema = None;
+                interval_minutes = fallback;
+                continue;
+            }
+
+            if ema.is_none() {
+                let avg =
+                    compute_average_gap_minutes(&mut conn, user_id)?.unwrap_or(fallback as f64);
+                let clamped = avg.clamp(min_f, max_f);
+                ema = Some(clamped);
+            }
+
+            if let Some(current) = ema {
+                let mut new_ema = alpha * gap_minutes + (1.0 - alpha) * current;
+                new_ema = new_ema.clamp(min_f, max_f);
+                ema = Some(new_ema);
+                interval_minutes = new_ema.round() as i64;
+            }
         }
-        if timestamps.len() < 2 {
-            return Ok(ActivityProfile {
-                interval_minutes: default_interval,
-                activity_tier: Some(derive_activity_tier(default_interval)),
-            });
+
+        star_count = new_star_count;
+        if star_count < 3 {
+            ema = None;
+            interval_minutes = fallback;
+        } else if gaps.is_empty() {
+            if let Some(current) = ema {
+                interval_minutes = current.round() as i64;
+            } else if let Some(avg) = compute_average_gap_minutes(&mut conn, user_id)? {
+                let clamped = avg.clamp(min_f, max_f);
+                ema = Some(clamped);
+                interval_minutes = clamped.round() as i64;
+            } else {
+                interval_minutes = fallback;
+            }
         }
-        let mut diffs = Vec::new();
-        for window in timestamps.windows(2) {
-            let first = window[0];
-            let second = window[1];
-            let diff = first - second;
-            diffs.push(diff);
-        }
-        let total_minutes: i64 = diffs.into_iter().map(|d| d.num_minutes().max(1)).sum();
-        let avg_minutes = total_minutes as f64 / (timestamps.len() as f64 - 1.0);
-        let mut interval = avg_minutes.round() as i64;
-        if interval <= 0 {
-            interval = min_interval;
-        }
-        let interval = interval.clamp(min_interval, max_interval);
-        let tier = derive_activity_tier(interval);
+
+        interval_minutes = interval_minutes.clamp(min_clamped, max_clamped);
+        let activity_tier = derive_activity_tier(interval_minutes);
+
         Ok(ActivityProfile {
-            interval_minutes: interval,
-            activity_tier: Some(tier),
+            interval_minutes,
+            activity_tier: Some(activity_tier),
+            ema_minutes: ema,
         })
     })
     .await??;
@@ -481,6 +566,53 @@ fn derive_activity_tier(interval_minutes: i64) -> String {
     }
 }
 
+fn compute_gap_minutes(
+    events: &[StarEvent],
+    previous_last_starred: Option<DateTime<Utc>>,
+) -> Vec<i64> {
+    let mut gaps = Vec::new();
+    let mut prev = previous_last_starred;
+    for event in events {
+        if let Some(prev_ts) = prev {
+            let gap = (event.starred_at - prev_ts).num_minutes();
+            if gap > 0 {
+                gaps.push(gap);
+            }
+        }
+        prev = Some(event.starred_at);
+    }
+    gaps
+}
+
+fn compute_average_gap_minutes(
+    conn: &mut Connection,
+    user_id: i64,
+) -> rusqlite::Result<Option<f64>> {
+    let mut stmt =
+        conn.prepare("SELECT starred_at FROM stars WHERE user_id = ?1 ORDER BY starred_at ASC")?;
+    let mut rows = stmt.query([user_id])?;
+    let mut prev: Option<DateTime<Utc>> = None;
+    let mut total = 0i64;
+    let mut count = 0i64;
+    while let Some(row) = rows.next()? {
+        let starred_at_str: String = row.get(0)?;
+        let ts = parse_datetime_sql(&starred_at_str, 0)?;
+        if let Some(prev_ts) = prev {
+            let gap = (ts - prev_ts).num_minutes();
+            if gap > 0 {
+                total += gap;
+                count += 1;
+            }
+        }
+        prev = Some(ts);
+    }
+    if count == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(total as f64 / count as f64))
+    }
+}
+
 fn ensure_column(
     conn: &Connection,
     table: &str,
@@ -506,4 +638,118 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Resu
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use tempfile::NamedTempFile;
+
+    #[tokio::test]
+    async fn ema_fallback_for_sparse_history() {
+        let temp = NamedTempFile::new().unwrap();
+        init(temp.path()).await.unwrap();
+
+        let profile = recompute_interval(
+            temp.path(),
+            1,
+            10,
+            7 * 24 * 60,
+            60,
+            60,
+            1,
+            None,
+            2,
+            vec![30],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(profile.interval_minutes, 60);
+        assert_eq!(profile.activity_tier.as_deref(), Some("high"));
+        assert!(profile.ema_minutes.is_none());
+    }
+
+    #[tokio::test]
+    async fn ema_updates_with_smoothing() {
+        let temp = NamedTempFile::new().unwrap();
+        init(temp.path()).await.unwrap();
+
+        let profile = recompute_interval(
+            temp.path(),
+            1,
+            10,
+            7 * 24 * 60,
+            60,
+            90,
+            3,
+            Some(90.0),
+            4,
+            vec![30],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(profile.interval_minutes, 72);
+        assert_eq!(profile.activity_tier.as_deref(), Some("medium"));
+        assert_eq!(profile.ema_minutes.unwrap(), 72.0);
+    }
+
+    #[tokio::test]
+    async fn ema_bootstrap_on_third_event() {
+        let temp = NamedTempFile::new().unwrap();
+        init(temp.path()).await.unwrap();
+
+        let conn = Connection::open(temp.path()).unwrap();
+        conn.execute(
+            "INSERT INTO users (user_id, login, fetch_interval_minutes, next_check_at, activity_tier, ema_minutes, star_count)
+             VALUES (?1, ?2, ?3, ?4, 'medium', NULL, 3)",
+            params![1, "alice", 60, Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+
+        let t0 = Utc.with_ymd_and_hms(2025, 10, 20, 0, 0, 0).unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 10, 21, 0, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2025, 10, 21, 12, 0, 0).unwrap();
+
+        for ts in [t0, t1, t2] {
+            conn.execute(
+                "INSERT INTO stars (user_id, repo_full_name, repo_description, repo_language, repo_topics, repo_html_url, starred_at, fetched_at)
+                 VALUES (?1, ?2, NULL, NULL, NULL, ?3, ?4, ?4)",
+                params![1, "example/repo", "https://example.com", ts.to_rfc3339()],
+            )
+            .unwrap();
+        }
+
+        drop(conn);
+
+        let profile = recompute_interval(
+            temp.path(),
+            1,
+            10,
+            7 * 24 * 60,
+            60,
+            60,
+            2,
+            None,
+            3,
+            vec![(t2 - t1).num_minutes()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(profile.interval_minutes, 972);
+        assert_eq!(profile.activity_tier.as_deref(), Some("medium"));
+        assert!((profile.ema_minutes.unwrap() - 972.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn activity_tier_thresholds() {
+        assert_eq!(derive_activity_tier(10), "high");
+        assert_eq!(derive_activity_tier(60), "high");
+        assert_eq!(derive_activity_tier(61), "medium");
+        assert_eq!(derive_activity_tier(1440), "medium");
+        assert_eq!(derive_activity_tier(1441), "low");
+    }
 }
