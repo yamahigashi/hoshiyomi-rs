@@ -1,7 +1,7 @@
 # Design: GitHub OAuth Device Flow Integration
 
 ## Overview
-We will layer a device-code OAuth flow on top of the existing PAT-based authentication. Users can run `starchaser auth login` to initiate GitHub's device authorization, approve via browser, and have the CLI capture the issued access token. The main polling pipeline will consume whichever credential is present—OAuth token first, PAT fallback.
+We will layer a device-code OAuth flow on top of the existing PAT-based authentication. Users can run `hoshiyomi auth login` to initiate GitHub's device authorization, approve via browser, and have the CLI capture the issued access token. The main polling pipeline will consume whichever credential is present—OAuth token first, PAT fallback.
 
 ## Components
 ### OAuth Client Configuration

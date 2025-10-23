@@ -1,10 +1,10 @@
 use anyhow::Result;
-use starchaser::Config;
-use starchaser::config::Mode;
-use starchaser::db::init;
-use starchaser::github::GitHubClient;
-use starchaser::pipeline::{build_feed_xml, poll_once};
-use starchaser::server;
+use hoshiyomi::Config;
+use hoshiyomi::config::Mode;
+use hoshiyomi::db::init;
+use hoshiyomi::github::GitHubClient;
+use hoshiyomi::pipeline::{build_feed_xml, poll_once};
+use hoshiyomi::server;
 use std::sync::Arc;
 
 #[tokio::main]

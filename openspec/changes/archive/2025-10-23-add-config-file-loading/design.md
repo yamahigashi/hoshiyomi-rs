@@ -21,8 +21,8 @@
 
 ## Discovery Order
 1. Path specified via `--config <file>` if present.
-2. `./starchaser.toml` (current working directory).
-3. `$XDG_CONFIG_HOME/starchaser/config.toml` or `~/.config/starchaser/config.toml` fallback on Unix; use `%AppData%` path on Windows.
+2. `./hoshiyomi.toml` (current working directory).
+3. `$XDG_CONFIG_HOME/hoshiyomi/config.toml` or `~/.config/hoshiyomi/config.toml` fallback on Unix; use `%AppData%` path on Windows.
 4. If no file found, skip gracefully.
 
 ## Merge Strategy

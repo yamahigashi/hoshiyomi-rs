@@ -1,10 +1,10 @@
 [package]
-name = "Starchaser"
+name = "Hoshiyomi"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "starchaser"
+name = "hoshiyomi"
 path = "src/lib.rs"
 
 [dependencies]

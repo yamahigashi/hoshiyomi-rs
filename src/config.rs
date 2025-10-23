@@ -747,10 +747,10 @@ fn load_config_file(path: Option<&Path>) -> Result<Option<LoadedConfig>> {
 fn default_config_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Ok(current_dir) = std::env::current_dir() {
-        paths.push(current_dir.join("starchaser.toml"));
+        paths.push(current_dir.join("hoshiyomi.toml"));
     }
     if let Some(mut config_dir) = dirs::config_dir() {
-        config_dir.push("starchaser");
+        config_dir.push("hoshiyomi");
         paths.push(config_dir.join("config.toml"));
     }
     paths
@@ -880,7 +880,7 @@ mod tests {
         );
         let cfg_path = cfg.path().to_str().unwrap();
         let args = [
-            "starchaser",
+            "hoshiyomi",
             "--config-path",
             cfg_path,
             "--github-token",
@@ -909,7 +909,7 @@ mod tests {
         let guard = EnvGuard::set(ENV_FEED_LENGTH, "40");
 
         let args = [
-            "starchaser",
+            "hoshiyomi",
             "--config-path",
             cfg_path,
             "--github-token",
@@ -932,7 +932,7 @@ mod tests {
             "#,
         );
         let cfg_path = cfg.path().to_str().unwrap();
-        let args = ["starchaser", "--config-path", cfg_path];
+        let args = ["hoshiyomi", "--config-path", cfg_path];
 
         let err = build_config_from_args(&args).unwrap_err();
         let message = format!("{}", err);

@@ -1,0 +1,11 @@
+- [x] 1. Finalize API contract notes (document `fetched_at`, ETag usage) and update `specs/web-feed-ui` accordingly.
+- [x] 2. Extend `GET /api/stars` handler to emit `fetched_at` plus strong ETags, with unit tests covering conditional requests.
+- [x] 3. Implement client background refresh loop, stale indicator, and retry banner; add mocked fetch tests.
+- [x] 4. Split HTML/CSS/JS into `frontend/` assets, add build pipeline to bundle/embed them, and cover with integration tests ensuring server serves the generated output.
+- [x] 5. Add client-side pagination controls (page size selector, nav buttons) persisted in URL/local storage; verify large dataset handling with tests.
+- [x] 6. Persist filters/sort/pagination into URL & local storage with shareable quick-filter chips; cover deep-link parsing in tests.
+- [x] 7. Implement `#star-user` click interactions to pin or exclude a user, including UI affordances and keyboard parity.
+- [x] 8. Deliver responsive layout + density toggle (≥1024px grid) and ensure Lighthouse accessibility score ≥90.
+- [x] 9. Add skip links, keyboard shortcuts, and focus styles respecting reduced-motion preferences.
+- [x] 10. Capture visual regression fixtures for key breakpoints and wire into CI snapshot check.
+- [x] 11. Update README/server docs with new UI behaviours and verify `cargo test` + lint passes.

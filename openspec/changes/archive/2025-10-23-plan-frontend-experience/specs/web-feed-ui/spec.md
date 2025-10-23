@@ -1,24 +1,4 @@
-# web-feed-ui Specification
-
-## Purpose
-TBD - created by archiving change update-web-feed-experience. Update Purpose after archive.
-## Requirements
-### Requirement: Interactive Star List Controls
-- The served HTML page MUST present the most recent items based on fetch time, ensuring newly ingested stars appear first regardless of their original `starred_at` value.
-
-#### Scenario: Items ordered by fetch time
-- **GIVEN** multiple star events with different `starred_at` values but identical fetch timestamps
-- **WHEN** the dashboard loads
-- **THEN** the events are ordered by `fetched_at` descending, so the last-ingested items appear first
-
-### Requirement: Star Metadata Visibility
-- Each star event in the web UI MUST show repository context along with the **fetch timestamp** so readers know when the data was ingested.
-
-#### Scenario: Fetch timestamp is displayed
-- **GIVEN** a stored star event includes a `fetched_at` timestamp
-- **WHEN** the event is rendered in the web UI
-- **THEN** the item shows the fetch timestamp (for example, “Fetched at 2025-10-23T04:15:00Z”) alongside existing metadata
-
+## MODIFIED Requirements
 ### Requirement: Star Data API for Web UI
 - The JSON response SHALL include `fetched_at` (RFC3339) and `ingest_sequence` (monotonic integer) alongside existing fields so clients can detect recency without re-computing.
 - The endpoint SHALL emit an `ETag` derived from the newest `fetched_at` plus total item count and honour `If-None-Match` by returning `304 Not Modified` when nothing changed.
@@ -28,6 +8,7 @@ TBD - created by archiving change update-web-feed-experience. Update Purpose aft
 - **WHEN** the UI calls `GET /api/stars` with `If-None-Match: W/"2025-10-23T05:00:00Z@50"`
 - **THEN** the server returns `304 Not Modified` with no body and the client keeps its cached list.
 
+## ADDED Requirements
 ### Requirement: Freshness Indicators for New Stars
 - The web UI SHALL track the latest `fetched_at` the reader has acknowledged and visually distinguish any newer star entries until they are marked as seen.
 - The UI SHALL display a “Last synced” timestamp and surface errors when background refresh fails, providing a manual retry affordance.
@@ -75,4 +56,3 @@ TBD - created by archiving change update-web-feed-experience. Update Purpose aft
 - **GIVEN** a reader uses only the keyboard on a desktop viewport ≥1024px
 - **WHEN** they press `Tab`, `Shift+Tab`, `/`, and `?`
 - **THEN** focus cycles through interactive controls in logical order, `/` focuses the search input, `?` opens the shortcuts help, and the grid layout adapts without breaking accessibility semantics.
-

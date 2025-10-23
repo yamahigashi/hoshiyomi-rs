@@ -1,0 +1,8 @@
+- [ ] 1. Document the desired `/api/stars` contract (query params, envelope shape, caching rules) in spec deltas and README notes.
+- [ ] 2. Draft repository/query module design for server-side filtering, including pagination and ordering tests using temporary SQLite fixtures.
+- [ ] 3. Update warp route mapping and handler skeletons to support envelope responses and filter parsing (no functional logic yet).
+- [ ] 4. Specify caching strategy (filter-aware ETags, Last-Modified semantics) and add test cases for conditional requests.
+- [ ] 5. Capture scheduler telemetry requirements (poll timestamps, next checks, error recording) and map them to `/api/status` response fields.
+- [ ] 6. Define `/api/options` payload (languages, tiers, users) and outline data hydration pipeline for efficient aggregation.
+- [ ] 7. Extend integration test plan covering mixed filter combinations, pagination edges, and status endpoint expectations.
+- [ ] 8. Update documentation (README/spec summary) with endpoint tables and sample curl usage once specs validate.

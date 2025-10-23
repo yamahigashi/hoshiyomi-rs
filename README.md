@@ -64,7 +64,7 @@ Use `Ctrl+C` (or send SIGINT) to shut the server down gracefully.
 
 ## Configuration File
 
-Instead of repeating a long list of flags, you can place settings in `starchaser.toml` (searched in the current directory, then `$XDG_CONFIG_HOME/starchaser/config.toml`, or specify an explicit path with `--config`).
+Instead of repeating a long list of flags, you can place settings in `hoshiyomi.toml` (searched in the current directory, then `$XDG_CONFIG_HOME/hoshiyomi/config.toml`, or specify an explicit path with `--config`).
 
 ```toml
 [github]
@@ -74,7 +74,7 @@ token = "ghp_..."
 db_path = "./following-stars.db"
 max_concurrency = 5
 api_base_url = "https://api.github.com"
-user_agent = "starchaser"
+user_agent = "hoshiyomi"
 timeout_secs = 30
 
 [polling]
@@ -90,7 +90,7 @@ port = 8080
 refresh_minutes = 15
 ```
 
-Precedence is: command-line flags > environment variables > config file > built-in defaults. Validation errors reference the source (for example, `config file /path/to/starchaser.toml (key polling.min_interval_minutes)`).
+Precedence is: command-line flags > environment variables > config file > built-in defaults. Validation errors reference the source (for example, `config file /path/to/hoshiyomi.toml (key polling.min_interval_minutes)`).
 
 ## Scheduling
 

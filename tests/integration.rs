@@ -7,11 +7,11 @@ use std::sync::Arc;
 use url::Url;
 use warp::http::StatusCode;
 
-use starchaser::config::{Config, Mode};
-use starchaser::db::{self, StarFeedRow};
-use starchaser::feed;
-use starchaser::github::{GitHubApiError, GitHubClient};
-use starchaser::server::{self, AppState};
+use hoshiyomi::config::{Config, Mode};
+use hoshiyomi::db::{self, StarFeedRow};
+use hoshiyomi::feed;
+use hoshiyomi::github::{GitHubApiError, GitHubClient};
+use hoshiyomi::server::{self, AppState};
 
 #[tokio::test]
 async fn github_client_returns_rate_limited_error() {
