@@ -53,6 +53,36 @@ The server performs an initial GitHub sync, then refreshes in the background eve
 
 Use `Ctrl+C` (or send SIGINT) to shut the server down gracefully.
 
+## Configuration File
+
+Instead of repeating a long list of flags, you can place settings in `starchaser.toml` (searched in the current directory, then `$XDG_CONFIG_HOME/starchaser/config.toml`, or specify an explicit path with `--config`).
+
+```toml
+[github]
+token = "ghp_..."
+
+[app]
+db_path = "./following-stars.db"
+max_concurrency = 5
+api_base_url = "https://api.github.com"
+user_agent = "starchaser"
+timeout_secs = 30
+
+[polling]
+feed_length = 100
+default_interval_minutes = 60
+min_interval_minutes = 10
+max_interval_minutes = 10080
+
+[server]
+enable = true
+bind = "0.0.0.0"
+port = 8080
+refresh_minutes = 15
+```
+
+Precedence is: command-line flags > environment variables > config file > built-in defaults. Validation errors reference the source (for example, `config file /path/to/starchaser.toml (key polling.min_interval_minutes)`).
+
 ## Scheduling
 
 The poller now adapts to each follower using an exponential moving average (α = 0.3) of recent star gaps. Accounts with fewer than three observed stars stay on the configured default interval (clamped between the global min/max) and are classified as `low` activity until more history accumulates. Highly active accounts naturally trend toward shorter intervals while long-dormant accounts stretch toward the maximum, keeping rate-limit usage predictable without manual tuning.

@@ -13,15 +13,17 @@ chrono = { version = "0.4", features = ["serde", "clock"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 reqwest = { version = "0.12", features = ["json", "gzip", "brotli", "stream"] }
 rss = "2.0"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-thiserror = "1.0"
-tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "time", "sync", "signal"] }
+thiserror = "2.0"
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time", "sync", "signal"] }
 url = "2.5"
 futures = "0.3"
-warp = "0.3"
+warp = "0.4"
 html-escape = "0.2"
+toml = "0.8"
+dirs = "5.0"
 
 [dev-dependencies]
 httpmock = "0.7"
