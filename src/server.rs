@@ -124,6 +124,7 @@ pub fn routes(
     let api_route = warp::path("api")
         .and(warp::path("stars"))
         .and(warp::path::end())
+        .and(warp::header::optional::<String>("if-none-match"))
         .and(with_state(state.clone()))
         .and_then(stars_handler);
 
@@ -188,16 +189,26 @@ async fn index_handler(state: Arc<AppState>) -> Result<WarpResponse, Infallible>
     }
 }
 
-async fn stars_handler(state: Arc<AppState>) -> Result<WarpResponse, Infallible> {
+async fn stars_handler(
+    if_none_match: Option<String>,
+    state: Arc<AppState>,
+) -> Result<WarpResponse, Infallible> {
     match state.recent_events().await {
         Ok(events) => {
+            let newest_fetched = events.first().map(|e| e.fetched_at);
+            let etag_value = compute_etag(&events);
+            if should_return_not_modified(if_none_match.as_deref(), &etag_value) {
+                let mut response = WarpResponse::new(Vec::<u8>::new().into());
+                *response.status_mut() = StatusCode::NOT_MODIFIED;
+                insert_cache_headers(&mut response, &etag_value, newest_fetched);
+                return Ok(response);
+            }
+
             let data: Vec<StarEventResponse> =
                 events.into_iter().map(StarEventResponse::from).collect();
             let reply = warp::reply::json(&data);
             let mut response = reply.into_response();
-            response
-                .headers_mut()
-                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            insert_cache_headers(&mut response, &etag_value, newest_fetched);
             Ok(response)
         }
         Err(err) => {
@@ -224,6 +235,7 @@ struct StarEventResponse {
     starred_at: String,
     fetched_at: String,
     user_activity_tier: Option<String>,
+    ingest_sequence: i64,
 }
 
 impl From<crate::db::StarFeedRow> for StarEventResponse {
@@ -238,6 +250,53 @@ impl From<crate::db::StarFeedRow> for StarEventResponse {
             starred_at: row.starred_at.to_rfc3339(),
             fetched_at: row.fetched_at.to_rfc3339(),
             user_activity_tier: row.user_activity_tier,
+            ingest_sequence: row.ingest_sequence,
+        }
+    }
+}
+
+fn compute_etag(events: &[crate::db::StarFeedRow]) -> String {
+    if let Some(first) = events.first() {
+        let latest = first.fetched_at.to_rfc3339();
+        let count = events.len();
+        format!("W/\"{}@{}\"", latest, count)
+    } else {
+        "W/\"empty@0\"".to_string()
+    }
+}
+
+fn should_return_not_modified(if_none_match: Option<&str>, etag: &str) -> bool {
+    if let Some(header_value) = if_none_match {
+        let trimmed = header_value.trim();
+        if trimmed == "*" {
+            true
+        } else {
+            trimmed
+                .split(',')
+                .map(|token| token.trim())
+                .any(|candidate| candidate == etag)
+        }
+    } else {
+        false
+    }
+}
+
+fn insert_cache_headers(
+    response: &mut WarpResponse,
+    etag_value: &str,
+    newest_fetched: Option<chrono::DateTime<Utc>>,
+) {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if let Ok(etag_header) = HeaderValue::from_str(etag_value) {
+        response.headers_mut().insert(header::ETAG, etag_header);
+    }
+    if let Some(ts) = newest_fetched {
+        if let Ok(last_modified) = HeaderValue::from_str(&ts.to_rfc2822()) {
+            response
+                .headers_mut()
+                .insert(header::LAST_MODIFIED, last_modified);
         }
     }
 }
@@ -332,6 +391,19 @@ mod tests {
             .reply(&routes)
             .await;
         assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        let etag = resp
+            .headers()
+            .get(header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .expect("etag present");
+        assert!(etag.starts_with("W/"));
+        assert!(resp.headers().get(header::LAST_MODIFIED).is_some());
 
         let body = resp.body();
         let payload: Value = serde_json::from_slice(body).unwrap();
@@ -344,5 +416,23 @@ mod tests {
         assert_eq!(first.get("user_activity_tier").unwrap(), "high");
         let topics = first.get("repo_topics").unwrap().as_array().unwrap();
         assert_eq!(topics.len(), 2);
+        assert_eq!(first.get("ingest_sequence").unwrap().as_i64(), Some(1));
+
+        let resp_304 = warp::test::request()
+            .path("/api/stars")
+            .header("if-none-match", etag)
+            .reply(&routes)
+            .await;
+        assert_eq!(resp_304.status(), StatusCode::NOT_MODIFIED);
+        assert!(resp_304.body().is_empty());
+        assert_eq!(
+            resp_304
+                .headers()
+                .get(header::ETAG)
+                .and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get(header::ETAG)
+                .and_then(|v| v.to_str().ok())
+        );
     }
 }

@@ -2,6 +2,7 @@ use std::path::Path;
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
+use rand::Rng;
 use rusqlite::types::Type;
 use rusqlite::{Connection, Error, OptionalExtension, params};
 
@@ -102,7 +103,7 @@ pub async fn init(db_path: &Path) -> Result<()> {
 pub async fn upsert_followings(
     db_path: &Path,
     users: &[FollowingUser],
-    default_interval_minutes: i64,
+    initial_interval_minutes: i64,
 ) -> Result<()> {
     if users.is_empty() {
         return Ok(());
@@ -118,7 +119,7 @@ pub async fn upsert_followings(
                 "INSERT INTO users (user_id, login, last_starred_at, last_fetched_at, etag, last_modified, fetch_interval_minutes, next_check_at, activity_tier, ema_minutes, star_count)
                  VALUES (?1, ?2, NULL, NULL, NULL, NULL, ?3, ?4, 'low', NULL, 0)
                  ON CONFLICT(user_id) DO UPDATE SET login = excluded.login",
-                params![user.id, user.login, default_interval_minutes, now],
+                params![user.id, user.login, initial_interval_minutes, now],
             )?;
         }
         tx.commit()?;
@@ -178,7 +179,7 @@ pub async fn record_not_modified(
 ) -> Result<()> {
     let path = db_path.to_path_buf();
     let fetched = fetched_at.to_rfc3339();
-    let next = (fetched_at + Duration::minutes(interval_minutes)).to_rfc3339();
+    let next = next_check_with_jitter(fetched_at, interval_minutes).to_rfc3339();
     tokio::task::spawn_blocking(move || -> rusqlite::Result<()> {
         let conn = Connection::open(path)?;
         conn.execute(
@@ -356,7 +357,8 @@ async fn update_after_events(
         gaps.to_vec(),
     )
     .await?;
-    let next = (fetched_at + Duration::minutes(activity.interval_minutes)).to_rfc3339();
+    let next_check = next_check_with_jitter(fetched_at, activity.interval_minutes);
+    let next = next_check.to_rfc3339();
     let fetched = fetched_at.to_rfc3339();
     let etag_val = etag;
     let last_mod_val = last_modified;
@@ -420,7 +422,8 @@ pub async fn recompute_interval(
         let mut conn = Connection::open(path)?;
         let min_clamped = min_interval.max(1);
         let max_clamped = max_interval.max(min_clamped);
-        let fallback = default_interval.clamp(min_clamped, max_clamped);
+        let fallback_default = default_interval.clamp(min_clamped, max_clamped);
+        let fallback_zero = max_clamped;
         let mut interval_minutes = previous_interval.clamp(min_clamped, max_clamped);
         let mut ema = previous_ema;
         let alpha = 0.3f64;
@@ -434,13 +437,13 @@ pub async fn recompute_interval(
 
             if star_count < 3 {
                 ema = None;
-                interval_minutes = fallback;
+                interval_minutes = fallback_default;
                 continue;
             }
 
             if ema.is_none() {
-                let avg =
-                    compute_average_gap_minutes(&mut conn, user_id)?.unwrap_or(fallback as f64);
+                let avg = compute_average_gap_minutes(&mut conn, user_id)?
+                    .unwrap_or(fallback_default as f64);
                 let clamped = avg.clamp(min_f, max_f);
                 ema = Some(clamped);
             }
@@ -454,9 +457,12 @@ pub async fn recompute_interval(
         }
 
         star_count = new_star_count;
-        if star_count < 3 {
+        if star_count == 0 {
             ema = None;
-            interval_minutes = fallback;
+            interval_minutes = fallback_zero;
+        } else if star_count < 3 {
+            ema = None;
+            interval_minutes = fallback_default;
         } else if gaps.is_empty() {
             if let Some(current) = ema {
                 interval_minutes = current.round() as i64;
@@ -465,7 +471,7 @@ pub async fn recompute_interval(
                 ema = Some(clamped);
                 interval_minutes = clamped.round() as i64;
             } else {
-                interval_minutes = fallback;
+                interval_minutes = fallback_default;
             }
         }
 
@@ -487,7 +493,7 @@ pub async fn recent_events_for_feed(db_path: &Path, limit: usize) -> Result<Vec<
     let events = tokio::task::spawn_blocking(move || -> rusqlite::Result<Vec<StarFeedRow>> {
         let conn = Connection::open(path)?;
         let mut stmt = conn.prepare(
-            "SELECT u.login, s.repo_full_name, s.repo_description, s.repo_language, s.repo_topics, s.repo_html_url, s.starred_at, s.fetched_at, u.activity_tier
+            "SELECT u.login, s.repo_full_name, s.repo_description, s.repo_language, s.repo_topics, s.repo_html_url, s.starred_at, s.fetched_at, u.activity_tier, s.id
              FROM stars s
              INNER JOIN users u ON u.user_id = s.user_id
              ORDER BY s.fetched_at DESC
@@ -510,6 +516,7 @@ pub async fn recent_events_for_feed(db_path: &Path, limit: usize) -> Result<Vec<
                 starred_at,
                 fetched_at,
                 user_activity_tier: row.get(8)?,
+                ingest_sequence: row.get(9)?,
             })
         })?;
         let mut events = Vec::new();
@@ -533,6 +540,7 @@ pub struct StarFeedRow {
     pub starred_at: DateTime<Utc>,
     pub fetched_at: DateTime<Utc>,
     pub user_activity_tier: Option<String>,
+    pub ingest_sequence: i64,
 }
 
 fn parse_datetime_sql(value: &str, index: usize) -> rusqlite::Result<DateTime<Utc>> {
@@ -560,6 +568,24 @@ fn parse_topics(value: Option<String>) -> rusqlite::Result<Vec<String>> {
     } else {
         Ok(Vec::new())
     }
+}
+
+fn next_check_with_jitter(base: DateTime<Utc>, interval_minutes: i64) -> DateTime<Utc> {
+    if interval_minutes <= 0 {
+        return base + Duration::minutes(1);
+    }
+
+    let jitter_cap = ((interval_minutes as f64) * 0.1).ceil() as i64;
+    let jitter_cap = jitter_cap.clamp(1, 30);
+    let mut rng = rand::thread_rng();
+    let jitter = if jitter_cap > 0 {
+        rng.gen_range(-jitter_cap..=jitter_cap)
+    } else {
+        0
+    };
+
+    let total_minutes = (interval_minutes + jitter).max(1);
+    base + Duration::minutes(total_minutes)
 }
 
 fn derive_activity_tier(interval_minutes: i64) -> String {
@@ -746,6 +772,48 @@ mod tests {
         assert_eq!(profile.interval_minutes, 972);
         assert_eq!(profile.activity_tier.as_deref(), Some("medium"));
         assert!((profile.ema_minutes.unwrap() - 972.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn zero_star_users_use_max_interval() {
+        let temp = NamedTempFile::new().unwrap();
+        init(temp.path()).await.unwrap();
+
+        let profile = recompute_interval(
+            temp.path(),
+            1,
+            10,
+            7 * 24 * 60,
+            60,
+            60,
+            0,
+            None,
+            0,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(profile.interval_minutes, 7 * 24 * 60);
+        assert_eq!(profile.activity_tier.as_deref(), Some("low"));
+        assert!(profile.ema_minutes.is_none());
+    }
+
+    #[test]
+    fn jitter_respects_bounds() {
+        let base = Utc::now();
+        let interval = 120;
+        let jitter_cap = ((interval as f64) * 0.1).ceil() as i64;
+        let jitter_cap = jitter_cap.clamp(1, 30);
+        let min_delay = (interval - jitter_cap).max(1);
+        let max_delay = interval + jitter_cap;
+
+        for _ in 0..100 {
+            let next = next_check_with_jitter(base, interval);
+            let delta = (next - base).num_minutes();
+            assert!(delta >= min_delay, "delta {} below {}", delta, min_delay);
+            assert!(delta <= max_delay, "delta {} above {}", delta, max_delay);
+        }
     }
 
     #[test]

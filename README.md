@@ -48,10 +48,17 @@ cargo run -- serve \
 The server performs an initial GitHub sync, then refreshes in the background every `refresh-minutes`. Access the endpoints at:
 
 - `http://<bind>:<port>/feed.xml` — RSS output
-- `http://<bind>:<port>/` — Interactive HTML dashboard with search, language and activity-tier filters, plus newest/alphabetical sorting
+- `http://<bind>:<port>/` — Interactive HTML dashboard with search, quick-filter chips, language/activity filters, newest/alphabetical sorting, background refresh, pagination, and per-user pin/exclude toggles
 - `http://<bind>:<port>/api/stars` — JSON payload backing the dashboard (includes descriptions, language, topics, and cached activity tiers)
 
 The dashboard orders entries by **fetch time**, so newly ingested stars bubble to the top even if the original `starred_at` timestamp is older. Each item shows both the starred time and the fetch time for context.
+
+### Dashboard Tips
+
+- Click a username to cycle between “show only this user”, “hide this user”, and clearing the filter.
+- Use the layout toggle to switch between comfortable and compact density; the UI switches to a responsive two-column grid on screens ≥ 1024 px.
+- Keyboard shortcuts: `/` focuses search, `[` and `]` page through results, `L` cycles languages, `M` marks new items as seen, `R` refreshes immediately, and `?` opens a cheat sheet. All shortcuts respect focus and reduced-motion preferences.
+- Pagination state, filters, sort order, density, and user selection persist across reloads and are encoded in the URL for easy sharing.
 
 Use `Ctrl+C` (or send SIGINT) to shut the server down gracefully.
 

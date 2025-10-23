@@ -15,12 +15,7 @@ use crate::github::{self, GitHubApiError, GitHubClient, StarFetchOutcome};
 
 pub async fn poll_once(config: &Config, client: Arc<GitHubClient>) -> Result<()> {
     let followings = fetch_followings_with_retry(client.clone()).await?;
-    upsert_followings(
-        &config.db_path,
-        &followings,
-        config.default_interval_minutes,
-    )
-    .await?;
+    upsert_followings(&config.db_path, &followings, config.max_interval_minutes).await?;
 
     let due = due_users(&config.db_path, Utc::now()).await?;
     if due.is_empty() {
