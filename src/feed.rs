@@ -1,3 +1,5 @@
+use std::cmp::Reverse;
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use html_escape::encode_text;
@@ -11,7 +13,9 @@ const CHANNEL_DESCRIPTION: &str =
     "Aggregated feed of repositories starred by the accounts you follow on GitHub.";
 
 pub fn build_feed(events: &[StarFeedRow], generated_at: DateTime<Utc>) -> Result<String> {
-    let items = events.iter().map(build_item).collect::<Vec<_>>();
+    let mut sorted = events.to_owned();
+    sorted.sort_by_key(|event| Reverse(event.starred_at));
+    let items = sorted.iter().map(build_item).collect::<Vec<_>>();
     let channel = ChannelBuilder::default()
         .title(CHANNEL_TITLE)
         .link(CHANNEL_LINK)
@@ -189,6 +193,10 @@ pub fn build_html(_events: &[StarFeedRow], generated_at: DateTime<Utc>) -> Strin
         gap: 0.5rem;
         font-size: 0.85rem;
         color: var(--muted);
+        align-items: center;
+      }}
+      .fetch-time {{
+        font-size: 0.8rem;
       }}
       .topic-tag {{
         background: rgba(3, 102, 214, 0.1);
@@ -400,11 +408,15 @@ pub fn build_html(_events: &[StarFeedRow], generated_at: DateTime<Utc>) -> Strin
               meta.appendChild(topicsWrap);
             }}
 
-            const timeEl = document.createElement("time");
-            timeEl.dateTime = item.starred_at;
-            const when = new Date(item.starred_at);
-            timeEl.textContent = when.toLocaleString();
-            meta.appendChild(timeEl);
+            const starredTime = document.createElement("time");
+            starredTime.dateTime = item.starred_at;
+            starredTime.textContent = new Date(item.starred_at).toLocaleString();
+            meta.appendChild(starredTime);
+
+            const fetchedSpan = document.createElement("span");
+            fetchedSpan.className = "fetch-time";
+            fetchedSpan.textContent = `Fetched: ${{new Date(item.fetched_at).toLocaleString()}}`;
+            meta.appendChild(fetchedSpan);
 
             li.appendChild(meta);
             list.appendChild(li);
@@ -440,7 +452,7 @@ pub fn build_html(_events: &[StarFeedRow], generated_at: DateTime<Utc>) -> Strin
           if (state.sort === "alpha") {{
             items.sort((a, b) => a.repo_full_name.localeCompare(b.repo_full_name));
           }} else {{
-            items.sort((a, b) => b.starred_at_ms - a.starred_at_ms);
+            items.sort((a, b) => b.fetched_at_ms - a.fetched_at_ms);
           }}
 
           resultCount.hidden = false;
@@ -488,7 +500,8 @@ pub fn build_html(_events: &[StarFeedRow], generated_at: DateTime<Utc>) -> Strin
                 ...item,
                 normalizedTier,
                 repo_topics: Array.isArray(item.repo_topics) ? item.repo_topics : [],
-                starred_at_ms: Date.parse(item.starred_at) || 0
+                starred_at_ms: Date.parse(item.starred_at) || 0,
+                fetched_at_ms: Date.parse(item.fetched_at) || 0
               }};
             }});
             populateFilters();

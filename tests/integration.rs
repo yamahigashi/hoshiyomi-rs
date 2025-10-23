@@ -63,6 +63,7 @@ fn feed_builder_includes_expected_fields() {
         repo_topics: vec!["compiler".into()],
         repo_html_url: "https://github.com/rust-lang/rust".into(),
         starred_at: Utc.with_ymd_and_hms(2025, 10, 18, 4, 15, 0).unwrap(),
+        fetched_at: Utc.with_ymd_and_hms(2025, 10, 18, 4, 16, 0).unwrap(),
         user_activity_tier: Some("high".into()),
     }];
 

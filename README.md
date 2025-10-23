@@ -51,6 +51,8 @@ The server performs an initial GitHub sync, then refreshes in the background eve
 - `http://<bind>:<port>/` — Interactive HTML dashboard with search, language and activity-tier filters, plus newest/alphabetical sorting
 - `http://<bind>:<port>/api/stars` — JSON payload backing the dashboard (includes descriptions, language, topics, and cached activity tiers)
 
+The dashboard orders entries by **fetch time**, so newly ingested stars bubble to the top even if the original `starred_at` timestamp is older. Each item shows both the starred time and the fetch time for context.
+
 Use `Ctrl+C` (or send SIGINT) to shut the server down gracefully.
 
 ## Configuration File

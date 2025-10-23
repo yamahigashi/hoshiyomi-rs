@@ -5,9 +5,10 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use serde::Serialize;
+use tokio::net::TcpListener;
 use tokio::sync::Notify;
-use warp::http::{HeaderValue, Response, StatusCode, header};
-use warp::hyper::Body;
+use warp::http::{HeaderValue, StatusCode, header};
+use warp::reply::Response as WarpResponse;
 use warp::{Filter, Reply};
 
 use crate::config::Mode;
@@ -63,8 +64,12 @@ pub async fn run_server(config: Config) -> Result<()> {
 
     let routes = routes(state.clone());
     let addr_tuple = (serve_options.bind, serve_options.port);
-    let (listening_addr, server) = warp::serve(routes)
-        .try_bind_with_graceful_shutdown(addr_tuple, shutdown_future(notify.clone()))?;
+    let listener = TcpListener::bind(addr_tuple).await?;
+    let listening_addr = listener.local_addr()?;
+    let server_future = warp::serve(routes)
+        .incoming(listener)
+        .graceful(shutdown_future(notify.clone()))
+        .run();
 
     println!(
         "Serving feed at http://{}:{}/ (feed.xml)",
@@ -92,7 +97,7 @@ pub async fn run_server(config: Config) -> Result<()> {
         }
     });
 
-    server.await;
+    server_future.await;
     poller.await.ok();
     Ok(())
 }
@@ -131,45 +136,59 @@ fn with_state(
     warp::any().map(move || state.clone())
 }
 
-async fn feed_handler(state: Arc<AppState>) -> Result<Response<Body>, Infallible> {
+async fn feed_handler(state: Arc<AppState>) -> Result<WarpResponse, Infallible> {
     match state.feed_xml().await {
-        Ok(xml) => Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/rss+xml")
-            .header("Cache-Control", "no-store")
-            .body(Body::from(xml))
-            .unwrap()),
+        Ok(xml) => {
+            let mut response = WarpResponse::new(xml.into());
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/rss+xml"),
+            );
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            Ok(response)
+        }
         Err(err) => {
             eprintln!("Failed to render feed: {err:?}");
-            Ok(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                .body(Body::from("Internal Server Error"))
-                .unwrap())
+            let mut response = WarpResponse::new("Internal Server Error".to_string().into());
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            Ok(response)
         }
     }
 }
 
-async fn index_handler(state: Arc<AppState>) -> Result<Response<Body>, Infallible> {
+async fn index_handler(state: Arc<AppState>) -> Result<WarpResponse, Infallible> {
     match state.html_page().await {
-        Ok(html) => Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .header("Cache-Control", "no-store")
-            .body(Body::from(html))
-            .unwrap()),
+        Ok(html) => {
+            let mut response = WarpResponse::new(html.into());
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            Ok(response)
+        }
         Err(err) => {
             eprintln!("Failed to render HTML: {err:?}");
-            Ok(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                .body(Body::from("Internal Server Error"))
-                .unwrap())
+            let mut response = WarpResponse::new("Internal Server Error".to_string().into());
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            Ok(response)
         }
     }
 }
 
-async fn stars_handler(state: Arc<AppState>) -> Result<Response<Body>, Infallible> {
+async fn stars_handler(state: Arc<AppState>) -> Result<WarpResponse, Infallible> {
     match state.recent_events().await {
         Ok(events) => {
             let data: Vec<StarEventResponse> =
@@ -183,11 +202,13 @@ async fn stars_handler(state: Arc<AppState>) -> Result<Response<Body>, Infallibl
         }
         Err(err) => {
             eprintln!("Failed to load star events: {err:?}");
-            Ok(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                .body(Body::from("Internal Server Error"))
-                .unwrap())
+            let mut response = WarpResponse::new("Internal Server Error".to_string().into());
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            Ok(response)
         }
     }
 }
@@ -201,6 +222,7 @@ struct StarEventResponse {
     repo_language: Option<String>,
     repo_topics: Vec<String>,
     starred_at: String,
+    fetched_at: String,
     user_activity_tier: Option<String>,
 }
 
@@ -214,6 +236,7 @@ impl From<crate::db::StarFeedRow> for StarEventResponse {
             repo_language: row.repo_language,
             repo_topics: row.repo_topics,
             starred_at: row.starred_at.to_rfc3339(),
+            fetched_at: row.fetched_at.to_rfc3339(),
             user_activity_tier: row.user_activity_tier,
         }
     }
@@ -317,6 +340,7 @@ mod tests {
         assert_eq!(first.get("login").unwrap(), "alice");
         assert_eq!(first.get("repo_full_name").unwrap(), "rust-lang/rust");
         assert_eq!(first.get("repo_language").unwrap(), "Rust");
+        assert!(first.get("fetched_at").is_some());
         assert_eq!(first.get("user_activity_tier").unwrap(), "high");
         let topics = first.get("repo_topics").unwrap().as_array().unwrap();
         assert_eq!(topics.len(), 2);

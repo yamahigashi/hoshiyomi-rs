@@ -487,15 +487,17 @@ pub async fn recent_events_for_feed(db_path: &Path, limit: usize) -> Result<Vec<
     let events = tokio::task::spawn_blocking(move || -> rusqlite::Result<Vec<StarFeedRow>> {
         let conn = Connection::open(path)?;
         let mut stmt = conn.prepare(
-            "SELECT u.login, s.repo_full_name, s.repo_description, s.repo_language, s.repo_topics, s.repo_html_url, s.starred_at, u.activity_tier
+            "SELECT u.login, s.repo_full_name, s.repo_description, s.repo_language, s.repo_topics, s.repo_html_url, s.starred_at, s.fetched_at, u.activity_tier
              FROM stars s
              INNER JOIN users u ON u.user_id = s.user_id
-             ORDER BY s.starred_at DESC
+             ORDER BY s.fetched_at DESC
              LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit as i64], |row| {
             let starred_at_str: String = row.get(6)?;
             let starred_at = parse_datetime_sql(&starred_at_str, 6)?;
+            let fetched_at_str: String = row.get(7)?;
+            let fetched_at = parse_datetime_sql(&fetched_at_str, 7)?;
             let topics_json: Option<String> = row.get(4)?;
             let topics = parse_topics(topics_json)?;
             Ok(StarFeedRow {
@@ -506,7 +508,8 @@ pub async fn recent_events_for_feed(db_path: &Path, limit: usize) -> Result<Vec<
                 repo_topics: topics,
                 repo_html_url: row.get(5)?,
                 starred_at,
-                user_activity_tier: row.get(7)?,
+                fetched_at,
+                user_activity_tier: row.get(8)?,
             })
         })?;
         let mut events = Vec::new();
@@ -528,6 +531,7 @@ pub struct StarFeedRow {
     pub repo_topics: Vec<String>,
     pub repo_html_url: String,
     pub starred_at: DateTime<Utc>,
+    pub fetched_at: DateTime<Utc>,
     pub user_activity_tier: Option<String>,
 }
 
