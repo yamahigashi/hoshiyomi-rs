@@ -1,16 +1,16 @@
 ## MODIFIED Requirements
 ### Requirement: Star Data API for Web UI
 - The UI client SHALL request `GET /api/stars` with query parameters mirroring its search, language, activity tier, user pin/exclude, sort, page, and page size controls, relying on the server to filter and paginate results.
-- The UI SHALL handle the JSON envelope `{ items, page, page_size, total, has_next, has_prev, etag }`, updating pagination controls and reusing `etag` via `If-None-Match` to avoid downloading unchanged pages.
+- The UI SHALL handle the JSON envelope `{ items, meta: { page, page_size, total, has_next, has_prev, etag, last_modified } }`, updating pagination controls from `meta` and reusing `etag` via `If-None-Match` to avoid downloading unchanged pages.
 
 #### Scenario: Server-side pagination drives UI state
 - **GIVEN** the reader selects language `Rust`, pins user `alice`, and navigates to page 3 with page size 25
 - **WHEN** the UI calls `/api/stars?language=Rust&user_mode=pin&user=alice&page=3&page_size=25`
-- **THEN** the response envelope populates the grid with 25 records, sets the page indicator to 3, and provides `has_prev=true`, `has_next` reflecting availability, enabling navigation without client-side filtering.
+- **THEN** the response envelope populates the grid with 25 records, sets the page indicator to 3 via `meta.page`, and provides `meta.has_prev=true`, `meta.has_next` reflecting availability, enabling navigation without client-side filtering.
 
 ## ADDED Requirements
 ### Requirement: Display Polling Status from API
-- The UI SHALL fetch `/api/status` after each star list refresh to display the last successful poll time, next scheduled refresh window, and any error message returned by the backend.
+- The UI SHALL fetch `/api/status` after each star list refresh to display the last successful poll time, next scheduled refresh window grouped by activity tier, current rate-limit headroom, and any error message returned by the backend.
 - If `/api/status` reports stale data (no success within the configurable interval) the UI SHALL surface a prominent warning and offer a manual retry action that reissues both `/api/stars` and `/api/status` requests.
 
 #### Scenario: Surfacing stale backend state
