@@ -1,20 +1,68 @@
-# Following Stars RSS
+# hoshiyomi · Following Stars RSS
 
-A Rust CLI that collects the repositories starred by the GitHub accounts you follow and emits an RSS feed you can subscribe to with any reader.
+hoshiyomi monitors the GitHub accounts you follow, stores every new star in SQLite, and republishes that activity as:
+- **RSS (`/feed.xml`)** for any feed reader
+- **Interactive web dashboard (`/`)** with filtering, search, and newest sorting options
+- **JSON API (`/api/stars`)** that powers the UI or downstream tooling
 
-## Usage
+The poller adapts to each user’s cadence using exponential moving averages, so highly active accounts refresh quickly while quieter ones back off to preserve rate limits.
 
+## Quick Start
+1. **Install prerequisites** (see below) and clone this repository.
+2. **Export a GitHub token** with `read:user` + `public_repo` scopes: `export GITHUB_TOKEN=ghp_...`.
+3. **Run a one-shot sync** to populate `following-stars.db` and emit RSS to stdout:
+   ```bash
+   cargo run --release -- \
+     --github-token "$GITHUB_TOKEN" \
+     --db-path ./following-stars.db \
+     --feed-length 100
+   ```
+4. **Launch the server** for the dashboard and API:
+   ```bash
+   cargo run --release -- serve \
+     --github-token "$GITHUB_TOKEN" \
+     --db-path ./following-stars.db \
+     --bind 127.0.0.1 \
+     --port 8080 \
+     --refresh-minutes 15
+   ```
+5. **Visit the endpoints**:
+   - `http://127.0.0.1:8080/` — web dashboard (search, filters, newest sort switcher)
+   - `http://127.0.0.1:8080/feed.xml` — RSS feed for your reader
+   - `http://127.0.0.1:8080/api/stars` — JSON payload powering the UI
+
+## Prerequisites
+- Rust 1.78+ (edition 2021) and Cargo
+- SQLite 3 (linked automatically via `rusqlite`)
+- OpenSSL headers + `pkg-config` (e.g., `sudo apt install libssl-dev pkg-config`)
+- GitHub personal access token with `read:user` and `public_repo`
+
+> **Build tip:** If OpenSSL detection fails, set `OPENSSL_DIR=/usr/lib/ssl` (path varies by OS) or install the development package for your platform.
+
+## Operating Modes
+### Batch CLI (one-shot)
+Use when you only need a fresh RSS export or want to run via CI/cron.
 ```bash
-cargo run -- \
-  --github-token <TOKEN> \
-  --db-path ./following-stars.db \
-  --max-concurrency 5 \
-  --feed-length 100
+cargo run --release -- --github-token "$GITHUB_TOKEN" --db-path ./following-stars.db --feed-length 200
 ```
+Outputs RSS to stdout, updates SQLite, then exits.
 
-You can also configure the CLI via environment variables:
+### Server Mode
+Recommended for always-on dashboards and feed hosting.
+- Performs an initial sync, then refreshes in the background (default 15 minutes).
+- Dashboard features: search, language/activity filters, per-user pin/exclude, pagination, density toggle, keyboard shortcuts, and a pair of newest sort modes (by star time or fetch time).
+- JSON API mirrors dashboard filters for external integrations.
 
-| Flag | Env Var | Default |
+### Automation / RSS-only Deployments
+Keep the CLI output up to date via scheduled jobs when you do not need the dashboard running continuously.
+- **systemd timer (user scope):** see [Operations & Automation](#operations--automation).
+- **GitHub Actions or other CI:** run the batch command on a schedule and publish `feed.xml` as an artifact or to Pages.
+
+## Configuration
+Configuration values merge with the following precedence: **flags > environment variables > config file > built-in defaults**.
+
+### Flags & Environment Variables
+| Flag | Environment variable | Default |
 | --- | --- | --- |
 | `--github-token` | `GITHUB_TOKEN` | _required_ |
 | `--db-path` | `FOLLOWING_RSS_DB_PATH` | `following-stars.db` |
@@ -30,42 +78,8 @@ You can also configure the CLI via environment variables:
 | `serve --port` | `FOLLOWING_RSS_PORT` | `8080` |
 | `serve --refresh-minutes` | `FOLLOWING_RSS_REFRESH_MINUTES` | `15` |
 
-The command writes the RSS XML to stdout and stores all state in the SQLite database. Re-run it periodically to refresh the feed.
-
-## Server Mode
-
-Run the CLI with the `serve` subcommand to host the feed as both `feed.xml` and a simple HTML index:
-
-```bash
-cargo run -- serve \
-  --github-token <TOKEN> \
-  --db-path ./following-stars.db \
-  --bind 0.0.0.0 \
-  --port 8080 \
-  --refresh-minutes 15
-```
-
-The server performs an initial GitHub sync, then refreshes in the background every `refresh-minutes`. Access the endpoints at:
-
-- `http://<bind>:<port>/feed.xml` — RSS output
-- `http://<bind>:<port>/` — Interactive HTML dashboard with search, quick-filter chips, language/activity filters, newest/alphabetical sorting, background refresh, pagination, and per-user pin/exclude toggles
-- `http://<bind>:<port>/api/stars` — JSON payload backing the dashboard (includes descriptions, language, topics, and cached activity tiers)
-
-The dashboard orders entries by **fetch time**, so newly ingested stars bubble to the top even if the original `starred_at` timestamp is older. Each item shows both the starred time and the fetch time for context.
-
-### Dashboard Tips
-
-- Click a username to cycle between “show only this user”, “hide this user”, and clearing the filter.
-- Use the layout toggle to switch between comfortable and compact density; the UI switches to a responsive two-column grid on screens ≥ 1024 px.
-- Keyboard shortcuts: `/` focuses search, `[` and `]` page through results, `L` cycles languages, `M` marks new items as seen, `R` refreshes immediately, and `?` opens a cheat sheet. All shortcuts respect focus and reduced-motion preferences.
-- Pagination state, filters, sort order, density, and user selection persist across reloads and are encoded in the URL for easy sharing.
-
-Use `Ctrl+C` (or send SIGINT) to shut the server down gracefully.
-
-## Configuration File
-
-Instead of repeating a long list of flags, you can place settings in `hoshiyomi.toml` (searched in the current directory, then `$XDG_CONFIG_HOME/hoshiyomi/config.toml`, or specify an explicit path with `--config`).
-
+### Config File (`hoshiyomi.toml`)
+Search order: `./hoshiyomi.toml`, `$XDG_CONFIG_HOME/hoshiyomi/config.toml`, or a path passed to `--config`.
 ```toml
 [github]
 token = "ghp_..."
@@ -89,15 +103,11 @@ bind = "0.0.0.0"
 port = 8080
 refresh_minutes = 15
 ```
+Validation errors identify the source (flag/env/file) so you can correct misconfigurations quickly.
 
-Precedence is: command-line flags > environment variables > config file > built-in defaults. Validation errors reference the source (for example, `config file /path/to/hoshiyomi.toml (key polling.min_interval_minutes)`).
-
-## Scheduling
-
-The poller now adapts to each follower using an exponential moving average (α = 0.3) of recent star gaps. Accounts with fewer than three observed stars stay on the configured default interval (clamped between the global min/max) and are classified as `low` activity until more history accumulates. Highly active accounts naturally trend toward shorter intervals while long-dormant accounts stretch toward the maximum, keeping rate-limit usage predictable without manual tuning.
-
-To refresh the feed every 15 minutes with systemd timers, create `~/.config/systemd/user/following-stars.service`:
-
+## Operations & Automation
+### systemd (user) timer
+`~/.config/systemd/user/following-stars.service`
 ```
 [Unit]
 Description=Generate GitHub following stars RSS
@@ -109,8 +119,7 @@ Environment=GITHUB_TOKEN=ghp_...
 ExecStart=/usr/bin/env cargo run --release -- --db-path /path/to/following-stars.db --feed-length 200
 ```
 
-And the companion timer `~/.config/systemd/user/following-stars.timer`:
-
+`~/.config/systemd/user/following-stars.timer`
 ```
 [Unit]
 Description=Run following-stars-rss every 15 minutes
@@ -123,17 +132,46 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 ```
+Enable with `systemctl --user enable --now following-stars.timer`.
 
-Enable with:
-
-```bash
-systemctl --user enable --now following-stars.timer
+### GitHub Actions (alternate scheduler)
+```yaml
+name: Refresh Feed
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get install -y libssl-dev pkg-config sqlite3
+      - run: cargo run --release -- --db-path ./following-stars.db --feed-length 200
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: feed
+          path: following-stars.db
 ```
+Adapt the final step to publish `feed.xml` or push to object storage as needed.
 
-Alternatively, use cron:
+## Troubleshooting
+| Issue | Symptoms | Suggested fix |
+| --- | --- | --- |
+| OpenSSL build failure | `openssl-sys` cannot find headers | Install `libssl-dev`/`openssl-devel`, set `OPENSSL_DIR`, or ensure `pkg-config` is on PATH |
+| GitHub rate limiting | API responses with status 403 and `Retry-After` | Reduce concurrency, increase `refresh-minutes`, or wait for reset (the poller honours `Retry-After` automatically) |
+| SQLite locked | `database is locked` during write | Run fewer concurrent pollers, increase polling interval, or move the DB onto faster storage |
 
-```cron
-*/15 * * * * cd /path/to/project && GITHUB_TOKEN=ghp_... cargo run --release -- --db-path /path/to/following-stars.db >> /path/to/feed.xml
-```
+## Contributor Guide
+- **Tests & formatting:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (requires OpenSSL prerequisites).
+- **Project layout:**
+  - `src/` — application code (`server.rs`, `pipeline.rs`, etc.)
+  - `frontend/` — dashboard assets bundled via `build.rs`
+  - `openspec/` — specifications and change proposals
+- **Workflow:** Propose behaviour changes by updating OpenSpec first (`openspec/changes/<id>/`), run `openspec validate <id> --strict`, then implement.
 
-Ensure the GitHub token has the `read:user` and `public_repo` scopes to access followings and starred repositories.
+## License
+MIT (see `LICENSE`).
