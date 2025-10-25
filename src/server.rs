@@ -1,20 +1,23 @@
-use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, RwLock};
 use warp::http::{HeaderValue, StatusCode, header};
 use warp::reply::Response as WarpResponse;
 use warp::{Filter, Reply};
 
 use crate::config::Mode;
 use crate::db::init;
-use crate::github::GitHubClient;
+use crate::db::star_query::{
+    self, NextCheckSummary, OptionsSnapshot, StarQuery, StarQueryResult, StarSort,
+    UserFilterMode as DbUserFilterMode,
+};
+use crate::github::{GitHubClient, RateLimitSnapshot};
 use crate::pipeline::{build_feed_xml, poll_once};
 use crate::{Config, feed};
 
@@ -24,14 +27,69 @@ const CACHE_CONTROL_STARS: &str = "private, max-age=0";
 const CACHE_CONTROL_STATUS: &str = "private, max-age=30, stale-while-revalidate=30";
 const CACHE_CONTROL_OPTIONS: &str = "public, max-age=300";
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SchedulerSnapshot {
+    last_poll_started: Option<DateTime<Utc>>,
+    last_poll_finished: Option<DateTime<Utc>>,
+    last_error: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct SchedulerState {
+    refresh_interval: ChronoDuration,
+    inner: Arc<RwLock<SchedulerSnapshot>>,
+}
+
+impl SchedulerState {
+    pub fn new(refresh_minutes: u64) -> Self {
+        let minutes = refresh_minutes.max(1);
+        Self {
+            refresh_interval: ChronoDuration::minutes(minutes as i64),
+            inner: Arc::new(RwLock::new(SchedulerSnapshot::default())),
+        }
+    }
+
+    pub async fn record_start(&self, at: DateTime<Utc>) {
+        let mut guard = self.inner.write().await;
+        guard.last_poll_started = Some(at);
+    }
+
+    pub async fn record_finish(&self, finished: DateTime<Utc>, error: Option<String>) {
+        let mut guard = self.inner.write().await;
+        guard.last_poll_finished = Some(finished);
+        guard.last_error = error;
+    }
+
+    pub(crate) async fn snapshot(&self) -> SchedulerSnapshot {
+        self.inner.read().await.clone()
+    }
+
+    pub(crate) fn is_stale(&self, now: DateTime<Utc>, snapshot: &SchedulerSnapshot) -> bool {
+        match snapshot.last_poll_finished {
+            Some(finished) => now - finished > self.refresh_interval * 2,
+            None => false,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     config: Arc<Config>,
+    scheduler: Arc<SchedulerState>,
+    github_client: Option<Arc<GitHubClient>>,
 }
 
 impl AppState {
-    pub fn new(config: Arc<Config>) -> Self {
-        Self { config }
+    pub fn new(
+        config: Arc<Config>,
+        scheduler: Arc<SchedulerState>,
+        github_client: Option<Arc<GitHubClient>>,
+    ) -> Self {
+        Self {
+            config,
+            scheduler,
+            github_client,
+        }
     }
 
     pub async fn feed_xml(&self) -> Result<String> {
@@ -48,55 +106,48 @@ impl AppState {
         crate::db::recent_events_for_feed(&self.config.db_path, self.config.feed_length).await
     }
 
+    pub async fn star_list(&self, query: &StarQuery) -> Result<StarQueryResult> {
+        star_query::query_stars(&self.config.db_path, query).await
+    }
+
+    pub async fn options_snapshot(&self) -> Result<OptionsSnapshot> {
+        star_query::options_snapshot(&self.config.db_path).await
+    }
+
+    pub async fn next_check_summary(&self) -> Result<NextCheckSummary> {
+        star_query::next_check_summary(&self.config.db_path).await
+    }
+
     pub fn config(&self) -> &Config {
         self.config.as_ref()
     }
+
+    pub fn scheduler(&self) -> Arc<SchedulerState> {
+        Arc::clone(&self.scheduler)
+    }
+
+    pub fn rate_limit_snapshot(&self) -> Option<RateLimitSnapshot> {
+        self.github_client
+            .as_ref()
+            .map(|client| client.rate_limit_snapshot())
+    }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum SortOrder {
+    #[default]
     Newest,
     Alpha,
 }
 
-impl Default for SortOrder {
-    fn default() -> Self {
-        SortOrder::Newest
-    }
-}
-
-impl SortOrder {
-    fn as_str(&self) -> &'static str {
-        match self {
-            SortOrder::Newest => "newest",
-            SortOrder::Alpha => "alpha",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum UserMode {
+    #[default]
     All,
     Pin,
     Exclude,
-}
-
-impl Default for UserMode {
-    fn default() -> Self {
-        UserMode::All
-    }
-}
-
-impl UserMode {
-    fn as_str(&self) -> &'static str {
-        match self {
-            UserMode::All => "all",
-            UserMode::Pin => "pin",
-            UserMode::Exclude => "exclude",
-        }
-    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -125,30 +176,40 @@ impl StarQueryParams {
         self.page_size.clamp(1, MAX_PAGE_SIZE)
     }
 
-    fn normalized_key(&self) -> String {
-        // Build a stable ordering for all provided filters so cache keys are deterministic.
-        let mut parts = BTreeMap::new();
-        if let Some(value) = self.q.as_ref().filter(|v| !v.is_empty()) {
-            parts.insert("q", value.trim().to_string());
+    fn to_star_query(&self) -> StarQuery {
+        StarQuery {
+            search: self
+                .q
+                .as_ref()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+            language: self
+                .language
+                .as_ref()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+            activity: self
+                .activity
+                .as_ref()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+            user: self
+                .user
+                .as_ref()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+            user_mode: match self.user_mode {
+                UserMode::All => DbUserFilterMode::All,
+                UserMode::Pin => DbUserFilterMode::Pin,
+                UserMode::Exclude => DbUserFilterMode::Exclude,
+            },
+            sort: match self.sort {
+                SortOrder::Newest => StarSort::Newest,
+                SortOrder::Alpha => StarSort::Alpha,
+            },
+            page: self.page() as usize,
+            page_size: self.page_size() as usize,
         }
-        if let Some(value) = self.language.as_ref().filter(|v| !v.is_empty()) {
-            parts.insert("language", value.trim().to_string());
-        }
-        if let Some(value) = self.activity.as_ref().filter(|v| !v.is_empty()) {
-            parts.insert("activity", value.trim().to_string());
-        }
-        if let Some(value) = self.user.as_ref().filter(|v| !v.is_empty()) {
-            parts.insert("user", value.trim().to_string());
-        }
-        parts.insert("user_mode", self.user_mode.as_str().to_string());
-        parts.insert("sort", self.sort.as_str().to_string());
-        parts.insert("page", self.page().to_string());
-        parts.insert("page_size", self.page_size().to_string());
-        parts
-            .into_iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect::<Vec<_>>()
-            .join("&")
     }
 }
 
@@ -190,7 +251,18 @@ struct NextCheckAt {
     unknown: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+impl From<NextCheckSummary> for NextCheckAt {
+    fn from(summary: NextCheckSummary) -> Self {
+        Self {
+            high: summary.high.map(|dt| dt.to_rfc3339()),
+            medium: summary.medium.map(|dt| dt.to_rfc3339()),
+            low: summary.low.map(|dt| dt.to_rfc3339()),
+            unknown: summary.unknown.map(|dt| dt.to_rfc3339()),
+        }
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
 struct StatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     last_poll_started: Option<String>,
@@ -204,20 +276,6 @@ struct StatusResponse {
     rate_limit_remaining: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rate_limit_reset: Option<String>,
-}
-
-impl Default for StatusResponse {
-    fn default() -> Self {
-        Self {
-            last_poll_started: None,
-            last_poll_finished: None,
-            is_stale: false,
-            next_check_at: NextCheckAt::default(),
-            last_error: None,
-            rate_limit_remaining: None,
-            rate_limit_reset: None,
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -263,10 +321,24 @@ pub async fn run_server(config: Config) -> Result<()> {
     init(&config.db_path).await?;
     let config = Arc::new(config);
     let client = Arc::new(GitHubClient::new(config.as_ref())?);
+    let scheduler = Arc::new(SchedulerState::new(serve_options.refresh_minutes));
 
-    poll_once(config.as_ref(), client.clone()).await?;
+    scheduler.record_start(Utc::now()).await;
+    match poll_once(config.as_ref(), client.clone()).await {
+        Ok(_) => scheduler.record_finish(Utc::now(), None).await,
+        Err(err) => {
+            scheduler
+                .record_finish(Utc::now(), Some(err.to_string()))
+                .await;
+            return Err(err);
+        }
+    }
 
-    let state = Arc::new(AppState::new(Arc::clone(&config)));
+    let state = Arc::new(AppState::new(
+        Arc::clone(&config),
+        Arc::clone(&scheduler),
+        Some(client.clone()),
+    ));
 
     let notify = Arc::new(Notify::new());
 
@@ -289,6 +361,7 @@ pub async fn run_server(config: Config) -> Result<()> {
     let poller_client = client.clone();
     let poller_notify = notify.clone();
     let refresh_interval = Duration::from_secs(serve_options.refresh_minutes * 60);
+    let poller_scheduler = Arc::clone(&scheduler);
 
     let poller = tokio::spawn(async move {
         let mut interval = tokio::time::interval(refresh_interval);
@@ -297,8 +370,12 @@ pub async fn run_server(config: Config) -> Result<()> {
             tokio::select! {
                 _ = poller_notify.notified() => break,
                 _ = interval.tick() => {
+                    poller_scheduler.record_start(Utc::now()).await;
                     if let Err(err) = poll_once(poller_config.as_ref(), poller_client.clone()).await {
                         eprintln!("Polling error: {err:?}");
+                        poller_scheduler.record_finish(Utc::now(), Some(err.to_string())).await;
+                    } else {
+                        poller_scheduler.record_finish(Utc::now(), None).await;
                     }
                 }
             }
@@ -421,15 +498,12 @@ async fn stars_handler(
     if_none_match: Option<String>,
     state: Arc<AppState>,
 ) -> Result<WarpResponse, Infallible> {
-    match state.recent_events().await {
-        Ok(events) => {
-            let total = events.len();
-            let page = params.page();
-            let page_size = params.page_size();
-            let start = ((page - 1) as usize).saturating_mul(page_size as usize);
-            let end = start.saturating_add(page_size as usize);
-            let newest_fetched = events.first().map(|e| e.fetched_at);
-            let etag_value = compute_stars_etag(&params, newest_fetched, total);
+    let query = params.to_star_query();
+    match state.star_list(&query).await {
+        Ok(result) => {
+            let newest_fetched = result.newest_fetched_at;
+            let total = result.total;
+            let etag_value = compute_stars_etag(&query.normalized_key(), newest_fetched, total);
 
             if should_return_not_modified(if_none_match.as_deref(), &etag_value) {
                 let mut response = WarpResponse::new(Vec::<u8>::new().into());
@@ -443,21 +517,20 @@ async fn stars_handler(
                 return Ok(response);
             }
 
-            let page_events = events
+            let has_next = query.page() * query.page_size() < total;
+            let has_prev = query.page() > 1 && total > 0;
+            let last_modified = newest_fetched.map(|ts| ts.to_rfc2822());
+            let items = result
+                .items
                 .into_iter()
-                .skip(start)
-                .take(page_size as usize)
                 .map(StarEventResponse::from)
                 .collect::<Vec<_>>();
-            let has_next = total > end;
-            let has_prev = page > 1 && total > 0;
-            let last_modified = newest_fetched.map(|ts| ts.to_rfc2822());
 
             let response_body = StarListResponse {
-                items: page_events,
+                items,
                 meta: StarListMeta {
-                    page,
-                    page_size,
+                    page: query.page() as u32,
+                    page_size: query.page_size() as u32,
                     total,
                     has_next,
                     has_prev,
@@ -490,9 +563,29 @@ async fn stars_handler(
 
 async fn status_handler(
     if_none_match: Option<String>,
-    _state: Arc<AppState>,
+    state: Arc<AppState>,
 ) -> Result<WarpResponse, Infallible> {
-    let status_body = StatusResponse::default();
+    let snapshot = state.scheduler().snapshot().await;
+    let next_check = match state.next_check_summary().await {
+        Ok(summary) => summary,
+        Err(err) => {
+            eprintln!("Failed to load next check summary: {err:?}");
+            NextCheckSummary::default()
+        }
+    };
+    let rate_limit = state.rate_limit_snapshot().unwrap_or_default();
+    let now = Utc::now();
+    let is_stale = state.scheduler().is_stale(now, &snapshot);
+
+    let status_body = StatusResponse {
+        last_poll_started: snapshot.last_poll_started.map(|dt| dt.to_rfc3339()),
+        last_poll_finished: snapshot.last_poll_finished.map(|dt| dt.to_rfc3339()),
+        is_stale,
+        next_check_at: NextCheckAt::from(next_check),
+        last_error: snapshot.last_error,
+        rate_limit_remaining: rate_limit.remaining,
+        rate_limit_reset: rate_limit.reset_at.map(|dt| dt.to_rfc3339()),
+    };
     let fingerprint = serde_json::to_string(&status_body).unwrap_or_default();
     let etag_value = compute_hashed_etag("status", &fingerprint);
 
@@ -511,17 +604,51 @@ async fn status_handler(
 
 async fn options_handler(
     if_none_match: Option<String>,
-    _state: Arc<AppState>,
+    state: Arc<AppState>,
 ) -> Result<WarpResponse, Infallible> {
-    let fingerprint = "languages=0|activity=0|users=0";
-    let etag_value = compute_hashed_etag("options", fingerprint);
+    let snapshot = match state.options_snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            eprintln!("Failed to load options snapshot: {err:?}");
+            OptionsSnapshot {
+                languages: Vec::new(),
+                activity: Vec::new(),
+                users: Vec::new(),
+                updated_at: None,
+            }
+        }
+    };
+    let fingerprint = snapshot.fingerprint();
+    let etag_value = compute_hashed_etag("options", &fingerprint);
     let response_body = OptionsResponse {
-        languages: Vec::new(),
-        activity_tiers: Vec::new(),
-        users: Vec::new(),
+        languages: snapshot
+            .languages
+            .into_iter()
+            .map(|lang| LanguageOption {
+                name: lang.name,
+                count: lang.count,
+            })
+            .collect(),
+        activity_tiers: snapshot
+            .activity
+            .into_iter()
+            .map(|tier| ActivityTierOption {
+                tier: tier.tier,
+                count: tier.count,
+            })
+            .collect(),
+        users: snapshot
+            .users
+            .into_iter()
+            .map(|user| UserOption {
+                login: user.login,
+                display_name: user.display_name,
+                count: user.count,
+            })
+            .collect(),
         meta: OptionsMeta {
             etag: etag_value.clone(),
-            last_modified: None,
+            last_modified: snapshot.updated_at.map(|dt| dt.to_rfc2822()),
         },
     };
 
@@ -570,14 +697,14 @@ impl From<crate::db::StarFeedRow> for StarEventResponse {
 }
 
 fn compute_stars_etag(
-    params: &StarQueryParams,
+    fingerprint: &str,
     newest_fetched: Option<DateTime<Utc>>,
     total: usize,
 ) -> String {
     let newest_fragment = newest_fetched
         .map(|ts| ts.timestamp_millis().to_string())
         .unwrap_or_else(|| "none".to_string());
-    let key = format!("{}|{}|{}", params.normalized_key(), newest_fragment, total);
+    let key = format!("{}|{}|{}", fingerprint, newest_fragment, total);
     compute_hashed_etag("stars", &key)
 }
 
@@ -630,12 +757,12 @@ fn insert_cache_headers(
     if let Ok(etag_header) = HeaderValue::from_str(etag_value) {
         response.headers_mut().insert(header::ETAG, etag_header);
     }
-    if let Some(ts) = newest_fetched {
-        if let Ok(last_modified) = HeaderValue::from_str(&ts.to_rfc2822()) {
-            response
-                .headers_mut()
-                .insert(header::LAST_MODIFIED, last_modified);
-        }
+    if let Some(ts) = newest_fetched
+        && let Ok(last_modified) = HeaderValue::from_str(&ts.to_rfc2822())
+    {
+        response
+            .headers_mut()
+            .insert(header::LAST_MODIFIED, last_modified);
     }
 }
 
@@ -645,6 +772,7 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use rusqlite::{Connection, params};
     use serde_json::Value;
+    use std::path::Path;
     use tempfile::NamedTempFile;
     use url::Url;
 
@@ -652,263 +780,166 @@ mod tests {
     async fn feed_handler_returns_xml() {
         let temp = NamedTempFile::new().unwrap();
         init(temp.path()).await.unwrap();
-        let config = Arc::new(Config {
-            github_token: "token".into(),
-            db_path: temp.path().to_path_buf(),
-            max_concurrency: 1,
-            feed_length: 10,
-            default_interval_minutes: 60,
-            min_interval_minutes: 10,
-            max_interval_minutes: 60,
-            api_base_url: Url::parse("https://example.com").unwrap(),
-            user_agent: "ua".into(),
-            timeout_secs: 10,
-            mode: Mode::Once,
-        });
-        let state = Arc::new(AppState::new(config));
+        let (state, _) = build_state(temp.path(), 10);
         let routes = routes(state);
         let resp = warp::test::request().path("/feed.xml").reply(&routes).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
-    async fn stars_endpoint_returns_json_payload() {
+    async fn stars_endpoint_paginates_and_filters() {
         let temp = NamedTempFile::new().unwrap();
         init(temp.path()).await.unwrap();
+        seed_user_with_star(temp.path(), 1, "alice", "rust-lang/rust", "Rust", "high").unwrap();
+        seed_user_with_star(temp.path(), 1, "alice", "rust-lang/cargo", "Rust", "high").unwrap();
+        seed_user_with_star(temp.path(), 2, "bob", "golang/go", "Go", "medium").unwrap();
 
+        let (state, _) = build_state(temp.path(), 10);
+        let routes = routes(state);
+        let resp = warp::test::request()
+            .path("/api/stars?language=Rust&user_mode=pin&user=alice&page_size=1")
+            .reply(&routes)
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(resp.body()).unwrap();
+        let meta = body.get("meta").unwrap();
+        assert_eq!(meta.get("total").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(meta.get("has_next").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(meta.get("page_size").and_then(|v| v.as_u64()), Some(1));
+        let etag = resp.headers().get(header::ETAG).unwrap().to_str().unwrap();
+        let resp_304 = warp::test::request()
+            .path("/api/stars?language=Rust&user_mode=pin&user=alice&page_size=1")
+            .header("if-none-match", etag)
+            .reply(&routes)
+            .await;
+        assert_eq!(resp_304.status(), StatusCode::NOT_MODIFIED);
+
+        let empty_resp = warp::test::request()
+            .path("/api/stars?language=Elixir")
+            .reply(&routes)
+            .await;
+        let empty_body: Value = serde_json::from_slice(empty_resp.body()).unwrap();
+        assert_eq!(
+            empty_body
+                .get("meta")
+                .and_then(|m| m.get("total"))
+                .and_then(|v| v.as_u64()),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn status_endpoint_reports_scheduler_and_next_checks() {
+        let temp = NamedTempFile::new().unwrap();
+        init(temp.path()).await.unwrap();
         let now = Utc::now();
         let conn = Connection::open(temp.path()).unwrap();
         conn.execute(
-            "INSERT INTO users (user_id, login, last_starred_at, last_fetched_at, etag, last_modified, fetch_interval_minutes, next_check_at, activity_tier)
-             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7)",
-            params![
-                1,
-                "alice",
-                now.to_rfc3339(),
-                now.to_rfc3339(),
-                30,
-                (now + ChronoDuration::minutes(30)).to_rfc3339(),
-                "high"
-            ],
+            "INSERT INTO users (user_id, login, last_starred_at, last_fetched_at, fetch_interval_minutes, next_check_at, activity_tier)
+             VALUES (?1, ?2, ?3, ?3, 30, ?4, 'high')",
+            params![1, "alice", now.to_rfc3339(), (now + ChronoDuration::minutes(30)).to_rfc3339()],
         )
         .unwrap();
-        let topics = serde_json::to_string(&vec!["rust", "cli"]).unwrap();
+
+        let (state, scheduler) = build_state(temp.path(), 10);
+        let routes = routes(state);
+        let stale_time = Utc::now() - ChronoDuration::minutes(120);
+        scheduler.record_start(stale_time).await;
+        scheduler
+            .record_finish(stale_time, Some("network error".into()))
+            .await;
+
+        let resp = warp::test::request()
+            .path("/api/status")
+            .reply(&routes)
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(body.get("is_stale").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            body.get("last_error").and_then(|v| v.as_str()),
+            Some("network error")
+        );
+        assert!(
+            body.get("next_check_at")
+                .and_then(|v| v.get("high"))
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn options_endpoint_returns_counts_and_cache_headers() {
+        let temp = NamedTempFile::new().unwrap();
+        init(temp.path()).await.unwrap();
+        seed_user_with_star(temp.path(), 1, "alice", "rust-lang/rust", "Rust", "high").unwrap();
+        seed_user_with_star(temp.path(), 2, "bob", "golang/go", "Go", "medium").unwrap();
+
+        let (state, _) = build_state(temp.path(), 10);
+        let routes = routes(state);
+        let resp = warp::test::request()
+            .path("/api/options")
+            .reply(&routes)
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let etag = resp.headers().get(header::ETAG).unwrap().to_str().unwrap();
+        let body: Value = serde_json::from_slice(resp.body()).unwrap();
+        let languages = body.get("languages").unwrap().as_array().unwrap();
+        assert_eq!(languages.len(), 2);
+        let resp_304 = warp::test::request()
+            .path("/api/options")
+            .header("if-none-match", etag)
+            .reply(&routes)
+            .await;
+        assert_eq!(resp_304.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    fn build_state(db_path: &Path, feed_length: usize) -> (Arc<AppState>, Arc<SchedulerState>) {
+        let config = Arc::new(test_config(db_path, feed_length));
+        let scheduler = Arc::new(SchedulerState::new(15));
+        let state = Arc::new(AppState::new(
+            Arc::clone(&config),
+            Arc::clone(&scheduler),
+            None,
+        ));
+        (state, scheduler)
+    }
+
+    fn test_config(db_path: &Path, feed_length: usize) -> Config {
+        Config {
+            github_token: "token".into(),
+            db_path: db_path.to_path_buf(),
+            max_concurrency: 1,
+            feed_length,
+            default_interval_minutes: 60,
+            min_interval_minutes: 10,
+            max_interval_minutes: 60 * 24,
+            api_base_url: Url::parse("https://example.com").unwrap(),
+            user_agent: "ua".into(),
+            timeout_secs: 10,
+            mode: Mode::Once,
+        }
+    }
+
+    fn seed_user_with_star(
+        db_path: &Path,
+        user_id: i64,
+        login: &str,
+        repo_full_name: &str,
+        language: &str,
+        tier: &str,
+    ) -> rusqlite::Result<()> {
+        let now = Utc::now();
+        let conn = Connection::open(db_path)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO users (user_id, login, last_starred_at, last_fetched_at, fetch_interval_minutes, next_check_at, activity_tier)
+             VALUES (?1, ?2, ?3, ?3, 30, ?3, ?4)",
+            params![user_id, login, now.to_rfc3339(), tier],
+        )?;
         conn.execute(
             "INSERT INTO stars (user_id, repo_full_name, repo_description, repo_language, repo_topics, repo_html_url, starred_at, fetched_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                1,
-                "rust-lang/rust",
-                "The Rust compiler",
-                "Rust",
-                topics,
-                "https://github.com/rust-lang/rust",
-                now.to_rfc3339(),
-                now.to_rfc3339(),
-            ],
-        )
-        .unwrap();
-
-        let config = Arc::new(Config {
-            github_token: "token".into(),
-            db_path: temp.path().to_path_buf(),
-            max_concurrency: 1,
-            feed_length: 10,
-            default_interval_minutes: 60,
-            min_interval_minutes: 10,
-            max_interval_minutes: 60 * 24,
-            api_base_url: Url::parse("https://example.com").unwrap(),
-            user_agent: "ua".into(),
-            timeout_secs: 10,
-            mode: Mode::Once,
-        });
-        let state = Arc::new(AppState::new(config));
-        let routes = routes(state);
-        let resp = warp::test::request()
-            .path("/api/stars")
-            .reply(&routes)
-            .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers()
-                .get(header::CACHE_CONTROL)
-                .and_then(|v| v.to_str().ok()),
-            Some(CACHE_CONTROL_STARS)
-        );
-        let etag = resp
-            .headers()
-            .get(header::ETAG)
-            .and_then(|v| v.to_str().ok())
-            .expect("etag present");
-        assert!(etag.starts_with("W/"));
-        assert!(resp.headers().get(header::LAST_MODIFIED).is_some());
-
-        let body = resp.body();
-        let payload: Value = serde_json::from_slice(body).unwrap();
-        let items = payload
-            .get("items")
-            .and_then(|v| v.as_array())
-            .expect("items array present");
-        let meta = payload
-            .get("meta")
-            .and_then(|v| v.as_object())
-            .expect("meta object present");
-        assert_eq!(items.len(), 1);
-        let first = items.first().unwrap();
-        assert_eq!(first.get("login").unwrap(), "alice");
-        assert_eq!(first.get("repo_full_name").unwrap(), "rust-lang/rust");
-        assert_eq!(first.get("repo_language").unwrap(), "Rust");
-        assert!(first.get("fetched_at").is_some());
-        assert_eq!(first.get("user_activity_tier").unwrap(), "high");
-        let topics = first.get("repo_topics").unwrap().as_array().unwrap();
-        assert_eq!(topics.len(), 2);
-        assert_eq!(first.get("ingest_sequence").unwrap().as_i64(), Some(1));
-        assert_eq!(meta.get("page").and_then(|v| v.as_u64()), Some(1));
-        assert_eq!(
-            meta.get("page_size").and_then(|v| v.as_u64()),
-            Some(DEFAULT_PAGE_SIZE as u64)
-        );
-        assert_eq!(meta.get("total").and_then(|v| v.as_u64()), Some(1));
-        assert_eq!(meta.get("has_next").and_then(|v| v.as_bool()), Some(false));
-        assert_eq!(meta.get("has_prev").and_then(|v| v.as_bool()), Some(false));
-        assert_eq!(
-            meta.get("etag")
-                .and_then(|v| v.as_str())
-                .expect("meta etag present"),
-            etag
-        );
-        assert!(meta.get("last_modified").is_some());
-
-        let resp_304 = warp::test::request()
-            .path("/api/stars")
-            .header("if-none-match", etag)
-            .reply(&routes)
-            .await;
-        assert_eq!(resp_304.status(), StatusCode::NOT_MODIFIED);
-        assert_eq!(
-            resp_304
-                .headers()
-                .get(header::CACHE_CONTROL)
-                .and_then(|v| v.to_str().ok()),
-            Some(CACHE_CONTROL_STARS)
-        );
-        assert!(resp_304.body().is_empty());
-        assert_eq!(
-            resp_304
-                .headers()
-                .get(header::ETAG)
-                .and_then(|v| v.to_str().ok()),
-            resp.headers()
-                .get(header::ETAG)
-                .and_then(|v| v.to_str().ok())
-        );
-    }
-
-    #[tokio::test]
-    async fn status_endpoint_returns_placeholder_payload() {
-        let temp = NamedTempFile::new().unwrap();
-        init(temp.path()).await.unwrap();
-
-        let config = Arc::new(Config {
-            github_token: "token".into(),
-            db_path: temp.path().to_path_buf(),
-            max_concurrency: 1,
-            feed_length: 10,
-            default_interval_minutes: 60,
-            min_interval_minutes: 10,
-            max_interval_minutes: 60 * 24,
-            api_base_url: Url::parse("https://example.com").unwrap(),
-            user_agent: "ua".into(),
-            timeout_secs: 10,
-            mode: Mode::Once,
-        });
-        let state = Arc::new(AppState::new(config));
-        let routes = routes(state);
-
-        let resp = warp::test::request()
-            .path("/api/status")
-            .reply(&routes)
-            .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers()
-                .get(header::CACHE_CONTROL)
-                .and_then(|v| v.to_str().ok()),
-            Some(CACHE_CONTROL_STATUS)
-        );
-        let etag = resp
-            .headers()
-            .get(header::ETAG)
-            .and_then(|v| v.to_str().ok())
-            .expect("etag present");
-        let body: Value = serde_json::from_slice(resp.body()).unwrap();
-        assert_eq!(body.get("is_stale").and_then(|v| v.as_bool()), Some(false));
-
-        let resp_304 = warp::test::request()
-            .path("/api/status")
-            .header("if-none-match", etag)
-            .reply(&routes)
-            .await;
-        assert_eq!(resp_304.status(), StatusCode::NOT_MODIFIED);
-        assert!(resp_304.body().is_empty());
-    }
-
-    #[tokio::test]
-    async fn options_endpoint_returns_placeholder_payload() {
-        let temp = NamedTempFile::new().unwrap();
-        init(temp.path()).await.unwrap();
-
-        let config = Arc::new(Config {
-            github_token: "token".into(),
-            db_path: temp.path().to_path_buf(),
-            max_concurrency: 1,
-            feed_length: 10,
-            default_interval_minutes: 60,
-            min_interval_minutes: 10,
-            max_interval_minutes: 60 * 24,
-            api_base_url: Url::parse("https://example.com").unwrap(),
-            user_agent: "ua".into(),
-            timeout_secs: 10,
-            mode: Mode::Once,
-        });
-        let state = Arc::new(AppState::new(config));
-        let routes = routes(state);
-
-        let resp = warp::test::request()
-            .path("/api/options")
-            .reply(&routes)
-            .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers()
-                .get(header::CACHE_CONTROL)
-                .and_then(|v| v.to_str().ok()),
-            Some(CACHE_CONTROL_OPTIONS)
-        );
-        let etag = resp
-            .headers()
-            .get(header::ETAG)
-            .and_then(|v| v.to_str().ok())
-            .expect("etag present");
-        let body: Value = serde_json::from_slice(resp.body()).unwrap();
-        let meta = body
-            .get("meta")
-            .and_then(|v| v.as_object())
-            .expect("options meta present");
-        assert_eq!(meta.get("etag").and_then(|v| v.as_str()), Some(etag));
-        assert!(
-            body.get("languages")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.is_empty())
-                .unwrap_or(false)
-        );
-
-        let resp_304 = warp::test::request()
-            .path("/api/options")
-            .header("if-none-match", etag)
-            .reply(&routes)
-            .await;
-        assert_eq!(resp_304.status(), StatusCode::NOT_MODIFIED);
-        assert!(resp_304.body().is_empty());
+             VALUES (?1, ?2, NULL, ?3, NULL, 'https://example.com/repo', ?4, ?4)",
+            params![user_id, repo_full_name, language, now.to_rfc3339()],
+        )?;
+        Ok(())
     }
 }

@@ -1,5 +1,7 @@
 use std::path::Path;
 
+pub mod star_query;
+
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
 use rand::Rng;
@@ -489,44 +491,15 @@ pub async fn recompute_interval(
 }
 
 pub async fn recent_events_for_feed(db_path: &Path, limit: usize) -> Result<Vec<StarFeedRow>> {
-    let path = db_path.to_path_buf();
-    let events = tokio::task::spawn_blocking(move || -> rusqlite::Result<Vec<StarFeedRow>> {
-        let conn = Connection::open(path)?;
-        let mut stmt = conn.prepare(
-            "SELECT u.login, s.repo_full_name, s.repo_description, s.repo_language, s.repo_topics, s.repo_html_url, s.starred_at, s.fetched_at, u.activity_tier, s.id
-             FROM stars s
-             INNER JOIN users u ON u.user_id = s.user_id
-             ORDER BY s.fetched_at DESC
-             LIMIT ?1",
-        )?;
-        let rows = stmt.query_map([limit as i64], |row| {
-            let starred_at_str: String = row.get(6)?;
-            let starred_at = parse_datetime_sql(&starred_at_str, 6)?;
-            let fetched_at_str: String = row.get(7)?;
-            let fetched_at = parse_datetime_sql(&fetched_at_str, 7)?;
-            let topics_json: Option<String> = row.get(4)?;
-            let topics = parse_topics(topics_json)?;
-            Ok(StarFeedRow {
-                login: row.get(0)?,
-                repo_full_name: row.get(1)?,
-                repo_description: row.get(2)?,
-                repo_language: row.get(3)?,
-                repo_topics: topics,
-                repo_html_url: row.get(5)?,
-                starred_at,
-                fetched_at,
-                user_activity_tier: row.get(8)?,
-                ingest_sequence: row.get(9)?,
-            })
-        })?;
-        let mut events = Vec::new();
-        for row in rows {
-            events.push(row?);
-        }
-        Ok(events)
-    })
-    .await??;
-    Ok(events)
+    use crate::db::star_query::{self, StarQuery};
+
+    let query = StarQuery {
+        page: 1,
+        page_size: limit.max(1),
+        ..StarQuery::default()
+    };
+    let result = star_query::query_stars(db_path, &query).await?;
+    Ok(result.items)
 }
 
 #[derive(Debug, Clone)]

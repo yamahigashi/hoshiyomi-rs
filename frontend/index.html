@@ -15,6 +15,13 @@
       <h1>GitHub Followings Stars</h1>
       <p class="timestamp">Last updated: __LAST_UPDATED__</p>
     </header>
+    <section id="summary-strip" class="summary-strip" aria-live="polite">
+      <div id="summary-count" class="summary-primary">Preparing summary…</div>
+      <div class="summary-meta">
+        <span id="summary-unseen" class="summary-badge" hidden></span>
+        <div id="summary-filters" class="summary-filters" hidden></div>
+      </div>
+    </section>
     <div id="sync-bar" class="sync-bar">
       <span id="sync-status">Last synced: never</span>
       <span id="sync-stale-badge" class="sync-badge" hidden>Stale</span>
@@ -40,6 +47,16 @@
       <button id="sort-toggle" type="button" aria-pressed="false">Sort: Newest</button>
       <button id="density-toggle" type="button" aria-pressed="false">Layout: Comfortable</button>
     </section>
+
+    <section id="preset-bar" class="preset-bar" aria-label="Saved view presets">
+      <div class="preset-bar__header">
+        <h2 class="preset-bar__title">Saved views</h2>
+        <button id="preset-save-button" type="button">Save current view</button>
+      </div>
+      <p class="preset-bar__hint" id="preset-hint">Capture your favorite filter combinations and recall them later or via keyboard shortcuts (Alt+1…Alt+5).</p>
+      <div id="preset-list" class="preset-list" role="list" aria-describedby="preset-hint"></div>
+    </section>
+
     <div id="quick-filters" class="quick-filters" hidden></div>
     <div id="user-filter-banner" class="user-filter-banner" hidden>
       <span id="user-filter-label"></span>
@@ -67,6 +84,7 @@
       </label>
     </div>
     <ul id="star-list" class="star-list" aria-live="polite"></ul>
+    <div id="virtual-status" class="status-line" aria-live="polite" hidden></div>
     <noscript>
       <p class="empty-state">JavaScript is required to explore stars interactively. Enable it and reload to search and filter.</p>
     </noscript>
@@ -101,7 +119,31 @@
             <dt>R</dt>
             <dd>Refresh now</dd>
           </div>
+          <div>
+            <dt>Alt + 1…5</dt>
+            <dd>Apply saved view 1–5</dd>
+          </div>
         </dl>
+      </div>
+    </div>
+
+    <div id="preset-modal" class="preset-modal" role="dialog" aria-modal="true" aria-labelledby="preset-modal-title" hidden>
+      <div class="preset-modal__panel" role="document">
+        <div class="preset-modal__header">
+          <h2 id="preset-modal-title">Save current view</h2>
+          <button id="preset-modal-close" type="button" class="preset-modal__close" aria-label="Close saved view dialog">×</button>
+        </div>
+        <form id="preset-form" class="preset-form">
+          <label class="preset-form__label" for="preset-name-input">Preset name
+            <input id="preset-name-input" name="name" type="text" maxlength="40" required autocomplete="off" placeholder="e.g., Rust, High activity">
+          </label>
+          <div class="preset-form__actions">
+            <button id="preset-delete-button" type="button" class="preset-form__secondary" hidden>Delete preset</button>
+            <div class="preset-form__spacer"></div>
+            <button id="preset-cancel-button" type="button" class="preset-form__secondary">Cancel</button>
+            <button id="preset-confirm-button" type="submit">Save</button>
+          </div>
+        </form>
       </div>
     </div>
     <script>

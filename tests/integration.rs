@@ -11,7 +11,7 @@ use hoshiyomi::config::{Config, Mode};
 use hoshiyomi::db::{self, StarFeedRow};
 use hoshiyomi::feed;
 use hoshiyomi::github::{GitHubApiError, GitHubClient};
-use hoshiyomi::server::{self, AppState};
+use hoshiyomi::server::{self, AppState, SchedulerState};
 
 #[tokio::test]
 async fn github_client_returns_rate_limited_error() {
@@ -124,7 +124,8 @@ async fn server_routes_serve_feed_and_html() {
         mode: Mode::Once,
     });
 
-    let state = Arc::new(AppState::new(config));
+    let scheduler = Arc::new(SchedulerState::new(15));
+    let state = Arc::new(AppState::new(config, scheduler, None));
     let routes = server::routes(state);
 
     let feed_resp = warp::test::request().path("/feed.xml").reply(&routes).await;

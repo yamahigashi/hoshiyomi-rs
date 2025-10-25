@@ -1,7 +1,8 @@
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use reqwest::{Client, StatusCode, Url, header};
 use serde::Deserialize;
 use thiserror::Error;
@@ -16,6 +17,18 @@ const STAR_ACCEPT_HEADER: &str =
 pub struct GitHubClient {
     client: Client,
     base_url: Url,
+    rate_limit: Arc<RateLimitState>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RateLimitSnapshot {
+    pub remaining: Option<u32>,
+    pub reset_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Default)]
+struct RateLimitState {
+    inner: Mutex<RateLimitSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +121,7 @@ impl GitHubClient {
         Ok(Self {
             client,
             base_url: config.api_base_url.clone(),
+            rate_limit: Arc::new(RateLimitState::default()),
         })
     }
 
@@ -124,6 +138,7 @@ impl GitHubClient {
                 .append_pair("page", &page.to_string());
 
             let response = self.client.get(url).send().await.map_err(|e| anyhow!(e))?;
+            self.rate_limit.update(response.headers());
             match response.status() {
                 StatusCode::OK => {
                     let body: Vec<ApiUser> = response
@@ -200,6 +215,7 @@ impl GitHubClient {
             }
 
             let response = request.send().await.map_err(|e| anyhow!(e))?;
+            self.rate_limit.update(response.headers());
             match response.status() {
                 StatusCode::OK => {
                     let headers = response.headers().clone();
@@ -276,6 +292,40 @@ impl GitHubClient {
             last_modified: newest_last_modified,
             events,
         })
+    }
+
+    pub fn rate_limit_snapshot(&self) -> RateLimitSnapshot {
+        self.rate_limit.snapshot()
+    }
+}
+
+impl RateLimitState {
+    fn update(&self, headers: &header::HeaderMap) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(remaining) = headers
+            .get("x-ratelimit-remaining")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|raw| raw.parse::<u32>().ok())
+        {
+            guard.remaining = Some(remaining);
+        }
+        if let Some(reset) = headers
+            .get("x-ratelimit-reset")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|raw| raw.parse::<i64>().ok())
+        {
+            guard.reset_at = Utc.timestamp_opt(reset, 0).single();
+        }
+    }
+
+    fn snapshot(&self) -> RateLimitSnapshot {
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 }
 
