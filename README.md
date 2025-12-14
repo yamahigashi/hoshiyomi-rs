@@ -1,6 +1,7 @@
 # hoshiyomi · Following Stars RSS
 
 hoshiyomi monitors the GitHub accounts you follow, stores every new star in SQLite, and republishes that activity as:
+- **Primary focus:** keep you up to date on the repositories your followings star, treating that activity stream as the core product signal.
 - **RSS (`/feed.xml`)** for any feed reader
 - **Interactive web dashboard (`/`)** with filtering, search, and newest sorting options
 - **JSON API (`/api/stars`)** that powers the UI or downstream tooling
@@ -24,12 +25,28 @@ The poller adapts to each user’s cadence using exponential moving averages, so
      --db-path ./following-stars.db \
      --bind 127.0.0.1 \
      --port 8080 \
-     --refresh-minutes 15
+     --refresh-minutes 15 \
+     --serve-prefix ""  # set to /your/prefix when behind a proxy
    ```
 5. **Visit the endpoints**:
    - `http://127.0.0.1:8080/` — web dashboard (search, filters, newest sort switcher)
    - `http://127.0.0.1:8080/feed.xml` — RSS feed for your reader
-   - `http://127.0.0.1:8080/api/stars` — JSON payload powering the UI
+   - `http://127.0.0.1:8080/api/stars` — JSON payload powering the UI  
+   *(prefix these paths when you set `--serve-prefix` or when your proxy injects `X-Forwarded-Prefix`.)*
+
+## API Reference
+### `GET /api/stars`
+- Query parameters mirror every dashboard control: `q`, `language`, `activity`, `user_mode` (`all|pin|exclude`), `user`, `sort` (`newest|alpha`), `page`, and `page_size` (1–100).
+- The response is `{ items: [...], meta: { page, page_size, total, has_next, has_prev, etag, last_modified } }` where each item includes repository metadata, `starred_at`, `fetched_at`, `user_activity_tier`, and a stable `ingest_sequence` integer.
+- Use the weak ETag from `meta.etag` with `If-None-Match` to avoid re-downloading unchanged filtered views; `last_modified` reflects the newest `fetched_at` within that filtered result set.
+
+### `GET /api/options`
+- Returns the derived quick-filter lists for languages, activity tiers, and users plus their counts: `{ languages, activity_tiers, users, meta }`.
+- Responses include `Cache-Control: public, max-age=300` and an ETag fingerprint so the frontend (or other clients) can reuse cached filter data until the underlying aggregates change.
+
+### `GET /api/status`
+- Exposes scheduler telemetry: `last_poll_started`, `last_poll_finished`, `is_stale`, grouped `next_check_at` timestamps (high/medium/low/unknown tiers), `last_error`, and the latest GitHub rate-limit headroom.
+- Designed for UI banners and health checks; cache hints are `private, max-age=30, stale-while-revalidate=30`, and the payload also honours `If-None-Match`.
 
 ## Prerequisites
 - Rust 1.78+ (edition 2021) and Cargo
@@ -52,6 +69,7 @@ Recommended for always-on dashboards and feed hosting.
 - Performs an initial sync, then refreshes in the background (default 15 minutes).
 - Dashboard features: search, language/activity filters, per-user pin/exclude, pagination, density toggle, keyboard shortcuts, and a pair of newest sort modes (by star time or fetch time).
 - JSON API mirrors dashboard filters for external integrations.
+- When reverse-proxied under a subpath, set `--serve-prefix /subpath` (or configure your proxy to send `X-Forwarded-Prefix`) so the routes and frontend fetches stay aligned.
 
 ### Automation / RSS-only Deployments
 Keep the CLI output up to date via scheduled jobs when you do not need the dashboard running continuously.
@@ -77,6 +95,7 @@ Configuration values merge with the following precedence: **flags > environment 
 | `serve --bind` | `FOLLOWING_RSS_BIND` | `127.0.0.1` |
 | `serve --port` | `FOLLOWING_RSS_PORT` | `8080` |
 | `serve --refresh-minutes` | `FOLLOWING_RSS_REFRESH_MINUTES` | `15` |
+| `serve --serve-prefix` | `FOLLOWING_RSS_SERVE_PREFIX` | _(empty)_ |
 
 ### Config File (`hoshiyomi.toml`)
 Search order: `./hoshiyomi.toml`, `$XDG_CONFIG_HOME/hoshiyomi/config.toml`, or a path passed to `--config`.
@@ -102,6 +121,7 @@ enable = true
 bind = "0.0.0.0"
 port = 8080
 refresh_minutes = 15
+# prefix = "/hoshiyomi" # optional path prefix when served behind a proxy
 ```
 Validation errors identify the source (flag/env/file) so you can correct misconfigurations quickly.
 
@@ -172,6 +192,7 @@ Adapt the final step to publish `feed.xml` or push to object storage as needed.
   - `frontend/` — dashboard assets bundled via `build.rs`
   - `openspec/` — specifications and change proposals
 - **Workflow:** Propose behaviour changes by updating OpenSpec first (`openspec/changes/<id>/`), run `openspec validate <id> --strict`, then implement.
+- **Frontend iteration:** Debug builds load `frontend/index.html`, `styles.css`, and `app.js` directly from disk so asset tweaks show up on reload without rebuilding; release builds still embed the bundle for deployments.
 
 ## License
 MIT (see `LICENSE`).

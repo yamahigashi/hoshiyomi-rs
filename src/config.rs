@@ -39,6 +39,7 @@ const ENV_CONFIG_PATH: &str = "FOLLOWING_RSS_CONFIG";
 const ENV_SERVE_BIND: &str = "FOLLOWING_RSS_BIND";
 const ENV_SERVE_PORT: &str = "FOLLOWING_RSS_PORT";
 const ENV_SERVE_REFRESH: &str = "FOLLOWING_RSS_REFRESH_MINUTES";
+const ENV_SERVE_PREFIX: &str = "FOLLOWING_RSS_SERVE_PREFIX";
 
 const ARG_GITHUB_TOKEN: &str = "github_token";
 const ARG_DB_PATH: &str = "db_path";
@@ -53,6 +54,7 @@ const ARG_TIMEOUT_SECS: &str = "timeout_secs";
 const ARG_SERVE_BIND: &str = "bind";
 const ARG_SERVE_PORT: &str = "port";
 const ARG_SERVE_REFRESH: &str = "refresh_minutes";
+const ARG_SERVE_PREFIX: &str = "serve_prefix";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -134,6 +136,10 @@ pub struct ServeArgs {
     /// Minutes between background refresh cycles.
     #[arg(long, env = ENV_SERVE_REFRESH, default_value_t = DEFAULT_REFRESH_MINUTES)]
     pub refresh_minutes: u64,
+
+    /// Optional path prefix when serving behind a reverse proxy.
+    #[arg(long, env = ENV_SERVE_PREFIX, default_value = "")]
+    pub serve_prefix: String,
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +168,7 @@ pub struct ServeOptions {
     pub bind: IpAddr,
     pub port: u16,
     pub refresh_minutes: u64,
+    pub serve_prefix: String,
 }
 
 impl Config {
@@ -189,42 +196,34 @@ impl Config {
     ) -> Result<Self> {
         let token = common.github_token.ok_or_else(|| {
             anyhow!(
-                "GitHub token is required (set via --github-token / {} or config file github.token)",
-                ENV_GITHUB_TOKEN
+                "GitHub token is required (set via --github-token / {ENV_GITHUB_TOKEN} or config file github.token)"
             )
         })?;
 
         if common.max_concurrency == 0 {
             let origin = origins.describe("max_concurrency");
             return Err(anyhow!(
-                "max concurrency must be greater than zero (source: {})",
-                origin
+                "max concurrency must be greater than zero (source: {origin})"
             ));
         }
 
         if common.feed_length == 0 {
             let origin = origins.describe("feed_length");
             return Err(anyhow!(
-                "feed length must be greater than zero (source: {})",
-                origin
+                "feed length must be greater than zero (source: {origin})"
             ));
         }
 
         if common.min_interval_minutes <= 0 {
             let origin = origins.describe("min_interval_minutes");
-            return Err(anyhow!(
-                "min interval must be positive (source: {})",
-                origin
-            ));
+            return Err(anyhow!("min interval must be positive (source: {origin})"));
         }
 
         if common.max_interval_minutes < common.min_interval_minutes {
             let max_origin = origins.describe("max_interval_minutes");
             let min_origin = origins.describe("min_interval_minutes");
             return Err(anyhow!(
-                "max interval must be >= min interval (sources: max={}, min={})",
-                max_origin,
-                min_origin
+                "max interval must be >= min interval (sources: max={max_origin}, min={min_origin})",
             ));
         }
 
@@ -240,10 +239,15 @@ impl Config {
             Some(Command::Serve(args)) => {
                 let origin = origins.describe("refresh_minutes");
                 let refresh_minutes = validate_refresh_minutes(args.refresh_minutes, &origin)?;
+                let serve_prefix = canonicalize_prefix(&args.serve_prefix).with_context(|| {
+                    let prefix_origin = origins.describe("serve_prefix");
+                    format!("invalid serve prefix (source: {prefix_origin})")
+                })?;
                 Mode::Serve(ServeOptions {
                     bind: args.bind,
                     port: args.port,
                     refresh_minutes,
+                    serve_prefix,
                 })
             }
             None => Mode::Once,
@@ -276,11 +280,34 @@ impl Config {
 fn validate_refresh_minutes(minutes: u64, origin: &str) -> Result<u64> {
     if minutes == 0 {
         Err(anyhow!(
-            "refresh minutes must be greater than zero (source: {})",
-            origin
+            "refresh minutes must be greater than zero (source: {origin})"
         ))
     } else {
         Ok(minutes)
+    }
+}
+
+pub fn canonicalize_prefix(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.contains(char::is_whitespace) {
+        return Err(anyhow!("serve prefix must not contain whitespace"));
+    }
+    let cleaned_segments: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
+    if cleaned_segments.is_empty() {
+        return Ok(String::new());
+    }
+    let mut normalized = String::new();
+    for segment in cleaned_segments {
+        normalized.push('/');
+        normalized.push_str(segment);
+    }
+    if normalized == "/" {
+        Ok(String::new())
+    } else {
+        Ok(normalized)
     }
 }
 
@@ -552,6 +579,27 @@ fn merge_configuration(
                 ),
             );
 
+            let file_prefix = server_cfg.and_then(|s| s.prefix.clone());
+            let (serve_prefix, used_config_prefix) = merge_scalar_subcommand(
+                serve_matches,
+                ARG_SERVE_PREFIX,
+                serve_args.serve_prefix.clone(),
+                file_prefix,
+            );
+            serve_args.serve_prefix = serve_prefix;
+            origins.set(
+                "serve_prefix",
+                determine_origin_subcommand(
+                    serve_matches,
+                    ARG_SERVE_PREFIX,
+                    "serve --serve-prefix",
+                    Some(ENV_SERVE_PREFIX),
+                    used_config_prefix,
+                    loaded,
+                    "server.prefix",
+                ),
+            );
+
             command = Some(Command::Serve(serve_args));
         }
         None => {
@@ -561,6 +609,7 @@ fn merge_configuration(
                 let bind = server.bind.unwrap_or(DEFAULT_BIND);
                 let port = server.port.unwrap_or(DEFAULT_PORT);
                 let refresh_minutes = server.refresh_minutes.unwrap_or(DEFAULT_REFRESH_MINUTES);
+                let serve_prefix = server.prefix.clone().unwrap_or_else(String::new);
                 origins.set(
                     "refresh_minutes",
                     loaded
@@ -574,6 +623,7 @@ fn merge_configuration(
                     bind,
                     port,
                     refresh_minutes,
+                    serve_prefix,
                 }));
             }
         }
@@ -715,8 +765,8 @@ enum ValueOrigin {
 impl ValueOrigin {
     fn describe(&self) -> String {
         match self {
-            ValueOrigin::Flag(flag) => format!("flag {}", flag),
-            ValueOrigin::Env(var) => format!("environment variable {}", var),
+            ValueOrigin::Flag(flag) => format!("flag {flag}"),
+            ValueOrigin::Env(var) => format!("environment variable {var}"),
             ValueOrigin::Config { path, key } => {
                 format!("config file {} (key {})", path.display(), key)
             }
@@ -815,6 +865,7 @@ struct ServerSection {
     bind: Option<IpAddr>,
     port: Option<u16>,
     refresh_minutes: Option<u64>,
+    prefix: Option<String>,
 }
 
 #[cfg(test)]
@@ -935,7 +986,7 @@ mod tests {
         let args = ["hoshiyomi", "--config-path", cfg_path];
 
         let err = build_config_from_args(&args).unwrap_err();
-        let message = format!("{}", err);
+        let message = format!("{err}");
         assert!(message.contains("min interval must be positive"));
         assert!(message.contains(cfg_path));
     }

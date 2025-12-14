@@ -197,7 +197,7 @@ impl GitHubClient {
         while continue_paging {
             let mut url = self
                 .base_url
-                .join(&format!("users/{}/starred", login))
+                .join(&format!("users/{login}/starred"))
                 .map_err(|e| anyhow!(e))?;
             url.query_pairs_mut()
                 .append_pair("per_page", &PER_PAGE.to_string())

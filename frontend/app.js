@@ -14,6 +14,21 @@
 	const PRESET_LAST_KEY = "starchaser:lastPresetId";
 	const MAX_PRESETS = 5;
 	const PAGE_CACHE_LIMIT = 3;
+	const perfApi = window.performance || null;
+	const perfParams = new URLSearchParams(window.location.search);
+	const PERF_DEBUG_ENABLED = perfParams.get("debug") === "perf";
+	const BASE_PATH = (window.__HOSHI_PREFIX__ || "").replace(/\/+$/, "");
+
+	function withBasePath(path) {
+		const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+		if (!BASE_PATH) {
+			return normalizedPath;
+		}
+		if (normalizedPath === "/") {
+			return BASE_PATH;
+		}
+		return `${BASE_PATH}${normalizedPath}`;
+	}
 
 	let fetchImpl = window.fetch.bind(window);
 	let refreshTimer = null;
@@ -38,6 +53,55 @@
 		listenersAttached: false,
 		statusTimer: null,
 	};
+
+	function logPerf(message, extra = undefined) {
+		if (!PERF_DEBUG_ENABLED) {
+			return;
+		}
+		if (extra !== undefined) {
+			console.info(`[perf] ${message}`, extra);
+		} else {
+			console.info(`[perf] ${message}`);
+		}
+	}
+
+	function markPerf(label) {
+		if (!PERF_DEBUG_ENABLED || !perfApi || typeof perfApi.mark !== "function") {
+			return;
+		}
+		try {
+			perfApi.mark(label);
+		} catch (err) {
+			console.warn("perf mark failed", label, err);
+		}
+	}
+
+	function measurePerf(name, start, end) {
+		if (!PERF_DEBUG_ENABLED || !perfApi || typeof perfApi.measure !== "function") {
+			return;
+		}
+		try {
+			perfApi.measure(name, start, end);
+			const entries = perfApi.getEntriesByName(name);
+			const entry = entries[entries.length - 1];
+			if (entry) {
+				logPerf(`${name}: ${entry.duration.toFixed(1)}ms`);
+			}
+		} catch (err) {
+			console.warn("perf measure failed", name, err);
+		}
+	}
+
+	function clearPerfMeasures(name) {
+		if (!PERF_DEBUG_ENABLED || !perfApi || typeof perfApi.clearMeasures !== "function") {
+			return;
+		}
+		try {
+			perfApi.clearMeasures(name);
+		} catch (err) {
+			console.warn("perf clear failed", name, err);
+		}
+	}
 
 	const dom = {
 		searchInput: document.getElementById("search-input"),
@@ -106,7 +170,22 @@
 		},
 		presets: [],
 		activePresetId: null,
+		renderSource: "network",
+		firstListPaintRecorded: false,
 	};
+
+	markPerf("bootstrap:init");
+
+	function noteFirstListPaint(kind) {
+		if (state.firstListPaintRecorded) {
+			return;
+		}
+		state.firstListPaintRecorded = true;
+		const label = `render:first:${kind}`;
+		markPerf(label);
+		measurePerf(`time-to-${kind}`, "bootstrap:init", label);
+		logPerf("first list render", { kind, page: state.page, source: state.renderSource });
+	}
 
 	const tierLabels = {
 		high: "High activity",
@@ -1130,6 +1209,7 @@
 		for (const item of items) {
 			list.appendChild(createCardElement(item, isCompact));
 		}
+		noteFirstListPaint("full");
 	}
 
 	function createCardElement(item, isCompact, itemIndex = null) {
@@ -1406,18 +1486,21 @@
 		beforeSpacer.setAttribute("aria-hidden", "true");
 		list.appendChild(beforeSpacer);
 
-		const slice = virtualState.items.slice(
-			virtualState.startIndex,
-			virtualState.endIndex,
+	const slice = virtualState.items.slice(
+		virtualState.startIndex,
+		virtualState.endIndex,
+	);
+	if (slice.length === 0 && forceEmptyCheck) {
+		list.appendChild(createEmptyStateItem());
+	}
+	slice.forEach((item, idx) => {
+		list.appendChild(
+			createCardElement(item, isCompact, virtualState.startIndex + idx),
 		);
-		if (slice.length === 0 && forceEmptyCheck) {
-			list.appendChild(createEmptyStateItem());
-		}
-		slice.forEach((item, idx) => {
-			list.appendChild(
-				createCardElement(item, isCompact, virtualState.startIndex + idx),
-			);
-		});
+	});
+	if (slice.length > 0) {
+		noteFirstListPaint("virtual");
+	}
 
 		const afterSpacer = document.createElement("li");
 		afterSpacer.className = "virtual-spacer";
@@ -1547,6 +1630,8 @@
 		const nextPage = meta?.page ?? state.page;
 		const pageChanged = state.page !== nextPage;
 		state.page = nextPage;
+		state.renderSource = options.source || "network";
+		state.firstListPaintRecorded = false;
 		flagNewItems();
 		populateFilters();
 		computeQuickFilters();
@@ -1565,12 +1650,17 @@
 		const initial = Boolean(options.initial);
 		const bypassCache = Boolean(options.bypassCache);
 		resetPaginationCachesIfNeeded();
+		const loadMarker = `loadPage:p${targetPage}`;
+		markPerf(loadMarker);
+		logPerf("loadPage", { page: targetPage, manual, initial, bypassCache });
 		if (!bypassCache) {
 			const cached = getCachedPageEntry(targetPage);
 			if (cached) {
+				logPerf("cache hit", { page: targetPage });
 				const normalized = normalizeItems(cached.rawItems);
 				applyPageData(normalized.items, cached.meta, normalized.newestFetched, {
 					manual,
+					source: "cache",
 				});
 				return;
 			}
@@ -1586,6 +1676,9 @@
 		const initial = Boolean(options.initial);
 		const targetPage = Math.max(1, options.pageOverride ?? state.page ?? 1);
 		const ignoreEtag = Boolean(options.ignoreEtag);
+		const fetchMarker = `fetch:stars:p${targetPage}`;
+		markPerf(`${fetchMarker}:start`);
+		logPerf("fetch start", { page: targetPage, manual, initial, ignoreEtag });
 		isFetching = true;
 		dom.refreshButton.disabled = true;
 		dom.retryButton.disabled = true;
@@ -1608,7 +1701,7 @@
 			}
 			const queryString = buildApiQuery({ page: targetPage }).toString();
 			const response = await fetchImpl(
-				`/api/stars${queryString ? `?${queryString}` : ""}`,
+				withBasePath(`/api/stars${queryString ? `?${queryString}` : ""}`),
 				{ headers },
 			);
 			const responseEtag = response.headers.get("ETag");
@@ -1623,8 +1716,16 @@
 						normalized.items,
 						cached.meta,
 						normalized.newestFetched,
-						{ manual },
+						{ manual, source: "cache" },
 					);
+					markPerf(`${fetchMarker}:304-cache`);
+					measurePerf(
+						`${fetchMarker}:duration`,
+						`${fetchMarker}:start`,
+						`${fetchMarker}:304-cache`,
+					);
+					clearPerfMeasures(`${fetchMarker}:duration`);
+					logPerf("fetch reused cache", { page: targetPage });
 					lastSyncedAt = new Date();
 					backoffMs = REFRESH_INTERVAL_MS;
 					setStatus("");
@@ -1645,6 +1746,8 @@
 				throw new Error(`Request failed with status ${response.status}`);
 			}
 			const payload = await response.json();
+      console.log('Fetched payload count:', Array.isArray(payload) ? payload.length : payload?.items?.length);
+      console.log('Fetched payload:', payload);
 			const rawItems = Array.isArray(payload)
 				? payload
 				: Array.isArray(payload?.items)
@@ -1653,9 +1756,18 @@
 			const meta = payload?.meta ?? null;
 			storePageCacheEntry(meta?.page ?? targetPage, rawItems, meta);
 			const normalized = normalizeItems(rawItems);
+			markPerf(`${fetchMarker}:done`);
+			measurePerf(
+				`${fetchMarker}:duration`,
+				`${fetchMarker}:start`,
+				`${fetchMarker}:done`,
+			);
+			clearPerfMeasures(`${fetchMarker}:duration`);
 			applyPageData(normalized.items, meta, normalized.newestFetched, {
 				manual,
+				source: options.source || "network",
 			});
+			logPerf("fetch success", { page: targetPage, count: normalized.items.length });
 			lastSyncedAt = new Date();
 			backoffMs = REFRESH_INTERVAL_MS;
 			setStatus("");
@@ -1663,6 +1775,7 @@
 			scheduleNextFetch(REFRESH_INTERVAL_MS);
 		} catch (err) {
 			console.error(err);
+			logPerf("fetch failure", { page: targetPage, message: err?.message });
 			showError("Failed to refresh starred repositories. Refresh when ready.");
 			backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
 			const seconds = Math.max(Math.round(backoffMs / 1000), 1);
@@ -1683,7 +1796,7 @@
 			if (optionsEtag) {
 				headers["If-None-Match"] = optionsEtag;
 			}
-			const response = await fetchImpl("/api/options", { headers });
+			const response = await fetchImpl(withBasePath("/api/options"), { headers });
 			if (response.status === 304) {
 				return;
 			}

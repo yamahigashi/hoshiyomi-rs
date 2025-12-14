@@ -784,8 +784,8 @@ mod tests {
         for _ in 0..100 {
             let next = next_check_with_jitter(base, interval);
             let delta = (next - base).num_minutes();
-            assert!(delta >= min_delay, "delta {} below {}", delta, min_delay);
-            assert!(delta <= max_delay, "delta {} above {}", delta, max_delay);
+            assert!(delta >= min_delay, "delta {delta} below {min_delay}");
+            assert!(delta <= max_delay, "delta {delta} above {max_delay}");
         }
     }
 

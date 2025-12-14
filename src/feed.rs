@@ -54,23 +54,26 @@ fn build_item(event: &StarFeedRow) -> rss::Item {
         .build()
 }
 
-pub fn build_html(_events: &[StarFeedRow], generated_at: DateTime<Utc>) -> String {
+pub fn build_html(_events: &[StarFeedRow], generated_at: DateTime<Utc>, base_path: &str) -> String {
     let generated_at_str = generated_at.to_rfc3339();
     let last_updated = encode_text(&generated_at_str);
+    let prefix = encode_text(base_path);
     if cfg!(debug_assertions)
-        && let Some(html) = try_build_html_from_disk(&last_updated)
+        && let Some(html) = try_build_html_from_disk(&last_updated, &prefix)
     {
         return html;
     }
-    build_html_from_embedded(&last_updated)
+    build_html_from_embedded(&last_updated, &prefix)
 }
 
-fn build_html_from_embedded(last_updated: &str) -> String {
+fn build_html_from_embedded(last_updated: &str, base_path: &str) -> String {
     static EMBEDDED_TEMPLATE: &str = include_str!(concat!(env!("OUT_DIR"), "/frontend_index.html"));
-    EMBEDDED_TEMPLATE.replace("__LAST_UPDATED__", last_updated)
+    EMBEDDED_TEMPLATE
+        .replace("__LAST_UPDATED__", last_updated)
+        .replace("__BASE_PATH__", base_path)
 }
 
-fn try_build_html_from_disk(last_updated: &str) -> Option<String> {
+fn try_build_html_from_disk(last_updated: &str, base_path: &str) -> Option<String> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let template_path = manifest_dir.join("frontend/index.html");
     let styles_path = manifest_dir.join("frontend/styles.css");
@@ -116,5 +119,9 @@ fn try_build_html_from_disk(last_updated: &str) -> Option<String> {
         .replace("{{STYLE}}", styles.trim())
         .replace("{{SCRIPT}}", script.trim());
 
-    Some(bundled.replace("__LAST_UPDATED__", last_updated))
+    Some(
+        bundled
+            .replace("__LAST_UPDATED__", last_updated)
+            .replace("__BASE_PATH__", base_path),
+    )
 }

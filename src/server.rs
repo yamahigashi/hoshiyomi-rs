@@ -11,7 +11,7 @@ use warp::http::{HeaderValue, StatusCode, header};
 use warp::reply::Response as WarpResponse;
 use warp::{Filter, Reply};
 
-use crate::config::Mode;
+use crate::config::{Mode, canonicalize_prefix};
 use crate::db::init;
 use crate::db::star_query::{
     self, NextCheckSummary, OptionsSnapshot, StarQuery, StarQueryResult, StarSort,
@@ -77,6 +77,7 @@ pub struct AppState {
     config: Arc<Config>,
     scheduler: Arc<SchedulerState>,
     github_client: Option<Arc<GitHubClient>>,
+    serve_prefix: String,
 }
 
 impl AppState {
@@ -84,11 +85,13 @@ impl AppState {
         config: Arc<Config>,
         scheduler: Arc<SchedulerState>,
         github_client: Option<Arc<GitHubClient>>,
+        serve_prefix: String,
     ) -> Self {
         Self {
             config,
             scheduler,
             github_client,
+            serve_prefix,
         }
     }
 
@@ -96,9 +99,9 @@ impl AppState {
         build_feed_xml(self.config.as_ref()).await
     }
 
-    pub async fn html_page(&self) -> Result<String> {
+    pub async fn html_page(&self, base_path: &str) -> Result<String> {
         let events = self.recent_events().await?;
-        let html = feed::build_html(&events, Utc::now());
+        let html = feed::build_html(&events, Utc::now(), base_path);
         Ok(html)
     }
 
@@ -130,6 +133,10 @@ impl AppState {
         self.github_client
             .as_ref()
             .map(|client| client.rate_limit_snapshot())
+    }
+
+    pub fn serve_prefix(&self) -> &str {
+        &self.serve_prefix
     }
 }
 
@@ -338,6 +345,7 @@ pub async fn run_server(config: Config) -> Result<()> {
         Arc::clone(&config),
         Arc::clone(&scheduler),
         Some(client.clone()),
+        serve_options.serve_prefix.clone(),
     ));
 
     let notify = Arc::new(Notify::new());
@@ -351,10 +359,23 @@ pub async fn run_server(config: Config) -> Result<()> {
         .graceful(shutdown_future(notify.clone()))
         .run();
 
+    let base_path = if serve_options.serve_prefix.is_empty() {
+        "/".to_string()
+    } else {
+        format!("{}/", serve_options.serve_prefix)
+    };
+    let feed_path = format!("{}{}", serve_options.serve_prefix, "/feed.xml");
     println!(
-        "Serving feed at http://{}:{}/ (feed.xml)",
+        "Serving hoshiyomi at http://{}:{}{}",
         listening_addr.ip(),
-        listening_addr.port()
+        listening_addr.port(),
+        base_path
+    );
+    println!(
+        "Feed endpoint: http://{}:{}{}",
+        listening_addr.ip(),
+        listening_addr.port(),
+        feed_path
     );
 
     let poller_config = Arc::clone(&config);
@@ -397,48 +418,84 @@ async fn shutdown_future(notify: Arc<Notify>) {
 pub fn routes(
     state: Arc<AppState>,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
-    let feed_route = warp::path("feed.xml")
-        .and(warp::path::end())
-        .and(with_state(state.clone()))
-        .and_then(feed_handler);
-
-    let index_route = warp::path::end()
-        .and(with_state(state.clone()))
-        .and_then(index_handler);
-
-    let stars_route = warp::path("api")
-        .and(warp::path("stars"))
-        .and(warp::path::end())
-        .and(warp::query::<StarQueryParams>())
+    warp::get()
+        .and(warp::path::full())
+        .and(
+            warp::query::raw()
+                .map(Some)
+                .or_else(|_| async { Ok::<(Option<String>,), Infallible>((None,)) }),
+        )
         .and(warp::header::optional::<String>("if-none-match"))
-        .and(with_state(state.clone()))
-        .and_then(stars_handler);
-
-    let status_route = warp::path("api")
-        .and(warp::path("status"))
-        .and(warp::path::end())
-        .and(warp::header::optional::<String>("if-none-match"))
-        .and(with_state(state.clone()))
-        .and_then(status_handler);
-
-    let options_route = warp::path("api")
-        .and(warp::path("options"))
-        .and(warp::path::end())
-        .and(warp::header::optional::<String>("if-none-match"))
+        .and(warp::header::optional::<String>("x-forwarded-prefix"))
         .and(with_state(state))
-        .and_then(options_handler);
-
-    feed_route
-        .or(index_route)
-        .or(stars_route)
-        .or(status_route)
-        .or(options_route)
+        .and_then(dispatch_request)
 }
 
 fn with_state(
     state: Arc<AppState>,
 ) -> impl Filter<Extract = (Arc<AppState>,), Error = Infallible> + Clone {
     warp::any().map(move || state.clone())
+}
+
+async fn dispatch_request(
+    full_path: warp::filters::path::FullPath,
+    raw_query: Option<String>,
+    if_none_match: Option<String>,
+    forwarded_prefix: Option<String>,
+    state: Arc<AppState>,
+) -> Result<WarpResponse, warp::Rejection> {
+    let raw_query = raw_query.unwrap_or_default();
+    let configured_prefix = state.serve_prefix().to_string();
+    let header_prefix = forwarded_prefix
+        .as_deref()
+        .and_then(|raw| canonicalize_prefix(raw).ok());
+    let effective_prefix = header_prefix.unwrap_or_else(|| configured_prefix.clone());
+
+    let Some(remainder) = strip_prefix(full_path.as_str(), &effective_prefix) else {
+        return Err(warp::reject::not_found());
+    };
+
+    match remainder {
+        "" | "/" => Ok(index_handler(effective_prefix, state).await?),
+        "/feed.xml" => Ok(feed_handler(state).await?),
+        "/api/stars" => {
+            let params: StarQueryParams = match serde_urlencoded::from_str(&raw_query) {
+                Ok(p) => p,
+                Err(_) => return Ok(bad_request("Invalid query parameters")),
+            };
+            Ok(stars_handler(params, if_none_match, state).await?)
+        }
+        "/api/status" => Ok(status_handler(if_none_match, state).await?),
+        "/api/options" => Ok(options_handler(if_none_match, state).await?),
+        _ => Err(warp::reject::not_found()),
+    }
+}
+
+fn strip_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    if prefix.is_empty() || prefix == "/" {
+        return Some(path);
+    }
+    if !path.starts_with(prefix) {
+        return None;
+    }
+    let remainder = &path[prefix.len()..];
+    if remainder.is_empty() {
+        Some("")
+    } else if remainder.starts_with('/') {
+        Some(remainder)
+    } else {
+        None
+    }
+}
+
+fn bad_request(message: &str) -> WarpResponse {
+    let mut response = WarpResponse::new(message.to_string().into());
+    *response.status_mut() = StatusCode::BAD_REQUEST;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
 }
 
 async fn feed_handler(state: Arc<AppState>) -> Result<WarpResponse, Infallible> {
@@ -467,8 +524,8 @@ async fn feed_handler(state: Arc<AppState>) -> Result<WarpResponse, Infallible> 
     }
 }
 
-async fn index_handler(state: Arc<AppState>) -> Result<WarpResponse, Infallible> {
-    match state.html_page().await {
+async fn index_handler(prefix: String, state: Arc<AppState>) -> Result<WarpResponse, Infallible> {
+    match state.html_page(&prefix).await {
         Ok(html) => {
             let mut response = WarpResponse::new(html.into());
             response.headers_mut().insert(
@@ -704,7 +761,7 @@ fn compute_stars_etag(
     let newest_fragment = newest_fetched
         .map(|ts| ts.timestamp_millis().to_string())
         .unwrap_or_else(|| "none".to_string());
-    let key = format!("{}|{}|{}", fingerprint, newest_fragment, total);
+    let key = format!("{fingerprint}|{newest_fragment}|{total}");
     compute_hashed_etag("stars", &key)
 }
 
@@ -714,7 +771,7 @@ fn compute_hashed_etag(label: &str, payload: &str) -> String {
     material.push('|');
     material.push_str(payload);
     let hash = fnv1a64(material.as_bytes());
-    format!("W/\"{}-{:016x}\"", label, hash)
+    format!("W/\"{label}-{hash:016x}\"")
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -893,6 +950,45 @@ mod tests {
         assert_eq!(resp_304.status(), StatusCode::NOT_MODIFIED);
     }
 
+    #[tokio::test]
+    async fn routes_respect_configured_prefix() {
+        let temp = NamedTempFile::new().unwrap();
+        init(temp.path()).await.unwrap();
+        let (state, _) = build_state_with_prefix(temp.path(), 10, "/hoshi");
+        let routes = routes(state);
+
+        let ok_resp = warp::test::request()
+            .path("/hoshi/feed.xml")
+            .reply(&routes)
+            .await;
+        assert_eq!(ok_resp.status(), StatusCode::OK);
+
+        let missing_resp = warp::test::request().path("/feed.xml").reply(&routes).await;
+        assert_eq!(missing_resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn forwarded_prefix_overrides_configured_prefix() {
+        let temp = NamedTempFile::new().unwrap();
+        init(temp.path()).await.unwrap();
+        let (state, _) = build_state_with_prefix(temp.path(), 10, "/hoshi");
+        let routes = routes(state);
+
+        let resp = warp::test::request()
+            .path("/alt/api/status")
+            .header("x-forwarded-prefix", "/alt/")
+            .reply(&routes)
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let missing_resp = warp::test::request()
+            .path("/hoshi/api/status")
+            .header("x-forwarded-prefix", "/alt/")
+            .reply(&routes)
+            .await;
+        assert_eq!(missing_resp.status(), StatusCode::NOT_FOUND);
+    }
+
     fn build_state(db_path: &Path, feed_length: usize) -> (Arc<AppState>, Arc<SchedulerState>) {
         let config = Arc::new(test_config(db_path, feed_length));
         let scheduler = Arc::new(SchedulerState::new(15));
@@ -900,6 +996,23 @@ mod tests {
             Arc::clone(&config),
             Arc::clone(&scheduler),
             None,
+            String::new(),
+        ));
+        (state, scheduler)
+    }
+
+    fn build_state_with_prefix(
+        db_path: &Path,
+        feed_length: usize,
+        prefix: &str,
+    ) -> (Arc<AppState>, Arc<SchedulerState>) {
+        let config = Arc::new(test_config(db_path, feed_length));
+        let scheduler = Arc::new(SchedulerState::new(15));
+        let state = Arc::new(AppState::new(
+            Arc::clone(&config),
+            Arc::clone(&scheduler),
+            None,
+            prefix.to_string(),
         ));
         (state, scheduler)
     }

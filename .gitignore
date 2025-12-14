@@ -1,2 +1,6 @@
 /target
 config.toml
+hoshiyomi.toml
+node_modules/
+.DS_Store
+following-stars.db

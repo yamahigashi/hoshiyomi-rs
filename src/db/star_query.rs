@@ -108,7 +108,7 @@ impl StarQuery {
         parts.insert("page_size", self.page_size().to_string());
         parts
             .into_iter()
-            .map(|(k, v)| format!("{}={}", k, v))
+            .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join("&")
     }
@@ -332,7 +332,7 @@ impl QueryBuilder {
             .map(|v| v.trim().to_lowercase())
             .filter(|v| !v.is_empty())
         {
-            let pattern = format!("%{}%", search);
+            let pattern = format!("%{search}%");
             clauses.push("(LOWER(s.repo_full_name) LIKE ? OR LOWER(COALESCE(s.repo_description, '')) LIKE ? )".to_string());
             bindings.push(Value::from(pattern.clone()));
             bindings.push(Value::from(pattern));

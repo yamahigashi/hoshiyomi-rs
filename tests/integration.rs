@@ -82,6 +82,7 @@ fn feed_builder_includes_expected_fields() {
     let html = feed::build_html(
         &events,
         Utc.with_ymd_and_hms(2025, 10, 18, 5, 0, 0).unwrap(),
+        "",
     );
     assert!(html.contains("GitHub Followings Stars"));
     assert!(html.contains("id=\"search-input\""));
@@ -125,7 +126,7 @@ async fn server_routes_serve_feed_and_html() {
     });
 
     let scheduler = Arc::new(SchedulerState::new(15));
-    let state = Arc::new(AppState::new(config, scheduler, None));
+    let state = Arc::new(AppState::new(config, scheduler, None, String::new()));
     let routes = server::routes(state);
 
     let feed_resp = warp::test::request().path("/feed.xml").reply(&routes).await;

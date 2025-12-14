@@ -13,7 +13,7 @@ async fn main() -> Result<()> {
     match &config.mode {
         Mode::Once => {
             let feed = run_once(&config).await?;
-            println!("{}", feed);
+            println!("{feed}");
             Ok(())
         }
         Mode::Serve(_) => server::run_server(config).await,
